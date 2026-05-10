@@ -19,12 +19,12 @@ jobs:
     name: Typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # pnpm version comes from the `packageManager` field in package.json.
       # Setting `with: version: ...` here would conflict and v6 refuses
       # to pick one.
-      - uses: pnpm/action-setup@v6.0.6
-      - uses: actions/setup-node@v6.4.0
+      - uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788 # v6.0.6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
           cache: pnpm
@@ -32,7 +32,7 @@ jobs:
       # invokes the binary needs bun on PATH. We don't run it in this job,
       # but pnpm runs the prepare/pretypecheck scripts which we want to
       # match the test job's environment exactly.
-      - uses: oven-sh/setup-bun@v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
       - run: pnpm install --frozen-lockfile
@@ -46,19 +46,19 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         # Tests create local commits in temporary git repos; the runner needs
         # full repo info for the kicadiff side that walks the project's own
         # git history (e.g. show <ref>:path).
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v6.0.6
-      - uses: actions/setup-node@v6.4.0
+      - uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788 # v6.0.6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
           cache: pnpm
-      - uses: oven-sh/setup-bun@v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -88,7 +88,7 @@ jobs:
       # because it lands under ~/.cache/ms-playwright, not in node_modules.
       - name: Cache Playwright browsers
         id: pw-cache
-        uses: actions/cache@v5.0.5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}

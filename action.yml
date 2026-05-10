@@ -210,7 +210,7 @@ runs:
     # `#!/usr/bin/env bun`) and to run `bunx` if install-kicadiff != skip.
     - name: Setup Bun
       if: ${{ steps.skip-check.outputs.skip != 'true' }}
-      uses: oven-sh/setup-bun@v2.2.0
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       with:
         bun-version: latest
 
@@ -324,7 +324,7 @@ runs:
     - name: Upload artifact
       id: upload
       if: ${{ steps.skip-check.outputs.skip != 'true' && inputs.upload-artifact == 'true' }}
-      uses: actions/upload-artifact@v5.0.0
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
       with:
         name: ${{ steps.artifact-name.outputs.name }}
         path: ${{ steps.run.outputs.output-dir }}
