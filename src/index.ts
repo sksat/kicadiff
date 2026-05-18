@@ -226,7 +226,7 @@ const INDEX_REF = ":0";
  *  normalise to `INDEX_REF` everywhere downstream so manifest output and
  *  comparison are consistent regardless of which spelling the user typed. */
 function isIndexAlias(s: string): boolean {
-  return s === ":0" || s === "index" || s === "staged";
+  return s === INDEX_REF || s === "index" || s === "staged";
 }
 
 /** Validate a string is a usable git ref. */
