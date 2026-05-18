@@ -18,7 +18,7 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath } from "./render.ts";
+import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath, resolveRefToSha } from "./render.ts";
 import type { LogLevel, ProjectRenderResult } from "./render.ts";
 import { textDiff, markdownDiff, computeFileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
@@ -556,9 +556,16 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
     console.error("Warning: text diff supports only .kicad_pcb / .kicad_sch — nothing to diff");
     return;
   }
-  const fromRef = parsed.fromRef ?? "HEAD";
-  const toRef = parsed.toRef ?? "";
   const repoRoot = repoRootOf(files[0]);
+  // Pin mutable refs to a commit SHA before any `git show`. textDiff reads
+  // each file twice (before + after), and across multiple files in a batch
+  // we'd issue many more reads — same race as the render path, same fix.
+  const fromRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
+    : (parsed.fromRef ?? "HEAD");
+  const toRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
+    : (parsed.toRef ?? "");
   const out = dest === "stderr"
     ? (s: string) => process.stderr.write(s + "\n")
     : (s: string) => console.log(s);
@@ -645,13 +652,22 @@ function buildMarkdownReport(
   project: ProjectRenderResult,
   mdDir: string,
 ): string {
-  const fromRef = parsed.fromRef ?? "HEAD";
-  const toRef = parsed.toRef ?? "";
-  const fromLabel = refLabelMd(fromRef);
-  const toLabel = refLabelMd(toRef);
   const repoRoot = project.results[0]
     ? repoRootOf(project.results[0].filePath)
     : null;
+  // Pin refs to commit SHAs so the structural diff (computed here via
+  // computeFileDiff → readAtRef) sees the same commit as the visual diff
+  // already rendered by renderProject. Without this the image and the
+  // component list could be computed against different commits if the
+  // branch moved between the render and the report.
+  const fromRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
+    : (parsed.fromRef ?? "HEAD");
+  const toRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
+    : (parsed.toRef ?? "");
+  const fromLabel = refLabelMd(fromRef);
+  const toLabel = refLabelMd(toRef);
 
   const fileTemplate = parsed.mdFileTemplate
     ? fs.readFileSync(parsed.mdFileTemplate, "utf8")

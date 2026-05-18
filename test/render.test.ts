@@ -619,9 +619,12 @@ test.describe("--md templating", () => {
   test("default templates produce the bundled report layout", () => {
     const md = runMd([]);
     // Sanity check the recognizable structure of the bundled default:
-    // a `## ` heading per file, the side-by-side image table.
+    // a `## ` heading per file, the side-by-side image table. The "before"
+    // label is the pinned commit short-SHA (refs get resolved before any
+    // git read), so we match against the 7-char hex shape rather than the
+    // literal "HEAD" the user typed.
     expect(md).toMatch(/^## `.+\.kicad_pcb` \(pcb\)/m);
-    expect(md).toMatch(/\| Before \(HEAD\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
     // Trailing newline (so the file has a clean POSIX-style ending).
     expect(md.endsWith("\n")).toBe(true);
   });
@@ -633,11 +636,14 @@ test.describe("--md templating", () => {
       "# Diff: {{from_label}} → {{to_label}}\n\nfile_count={{file_count}}\n\n{{file_sections}}\n",
     );
     const md = runMd(["--md-template", tplPath]);
-    expect(md).toContain("# Diff: HEAD → working tree");
+    // {{from_label}} = pinned short-SHA (refs get resolved at the boundary
+    // so the report reproduces against the exact commit, not whatever the
+    // ref points at later).
+    expect(md).toMatch(/^# Diff: [0-9a-f]{7} → working tree$/m);
     expect(md).toContain("file_count=2");
     // Default file template is still in effect, so the side-by-side table
     // should still appear inside the wrapped output.
-    expect(md).toMatch(/\| Before \(HEAD\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
   });
 
   test("--md-file-template overrides per-file rendering", () => {
@@ -1122,6 +1128,75 @@ test.describe("ref pinning", () => {
       for (const f of m.files) {
         expect(f.fromRef).toBe(sha);
       }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--md report shows short-SHA labels for branch refs (not the branch name)", () => {
+    // The render path pins refs and stores SHAs in the manifest; the
+    // markdown path (buildMarkdownReport) needs to pin too so the headings
+    // it generates agree with the images. The shared display rule is
+    // refLabelMd: 40-char SHA → 7-char short. Branches get pinned first,
+    // so a `--from feat` invocation shows "Before (<7 hex>)", not
+    // "Before (feat)".
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-md-"));
+    try {
+      const sha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+
+      const outDir = path.join(tmp, "out");
+      const mdOut = path.join(tmp, "md-out");
+      fs.mkdirSync(mdOut);
+      const r = spawnSync(CLI, [
+        "pcb", path.join(tmp, path.basename(PCB_FILE)),
+        "--from", "feat", "--output-dir", outDir, "--md", "--output", mdOut,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const md = fs.readFileSync(
+        path.join(mdOut, fs.readdirSync(mdOut).find(f => f.endsWith(".md"))!),
+        "utf8",
+      );
+      // Short SHA appears in the heading; the literal "feat" must not.
+      expect(md).toContain(`(${sha.slice(0, 7)})`);
+      expect(md).not.toContain("(feat)");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--text-only output stays consistent under a branch rename mid-flight", () => {
+    // We can't deterministically race the branch against a running kicadiff,
+    // but we can verify the closest observable: two consecutive --text-only
+    // runs against the same branch produce identical output even when HEAD
+    // (the *target* working tree comparison) sits at a different commit
+    // than the branch. This exercises the same code path that would
+    // misbehave if textdiff resolved the ref twice and got two different
+    // commits in between.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-text-"));
+    try {
+      initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      // Move HEAD forward — `feat` stays put.
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-am", "bump"], { cwd: tmp });
+
+      const run = () => spawnSync(CLI, [
+        "--text-only", "--from", "feat", pcbInTmp,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+      const a = run();
+      const b = run();
+      expect(a.status).toBe(0);
+      expect(b.status).toBe(0);
+      expect(a.stdout).toBe(b.stdout);
+      // The 330→470 bump from `feat` (still at init) to working tree must
+      // surface as an R1 value change.
+      expect(a.stdout).toMatch(/~\s*R1\s+value: 330 → 470/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
