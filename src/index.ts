@@ -483,12 +483,12 @@ async function main(): Promise<void> {
   }
 
   try {
-    // --text-only short-circuits rendering entirely — useful when piping the
-    // structural diff into another tool without paying for SVG/PNG.
-    if (parsed.textOnly) { printTextDiff(parsed); return; }
-
     // --watch hands off to the long-running watcher: it does the same
     // initial render, then keeps re-rendering on every input file change.
+    // Deliberately runs *before* the main pinning step below — each
+    // rerender re-pins on its own (inside renderProject), so watch tracks
+    // a moving branch over the lifetime of the watcher instead of being
+    // frozen to whatever the ref pointed at when the watcher started.
     if (parsed.watch) {
       const { startWatch } = await import("./watch.ts");
       await startWatch({
@@ -504,6 +504,19 @@ async function main(): Promise<void> {
       });
       return;
     }
+
+    // Pin mutable refs once at the top of the run so every downstream
+    // consumer — renderProject, printTextDiff, buildMarkdownReport — sees
+    // the same commit. Without this, the branch could move between the
+    // render and the report and the markdown headings + structural diff
+    // would describe a different commit pair than the already-rendered
+    // images. Each callee still pins again internally; that resolution is
+    // idempotent once the ref is already a 40-char SHA.
+    pinParsedRefs(parsed);
+
+    // --text-only short-circuits rendering entirely — useful when piping the
+    // structural diff into another tool without paying for SVG/PNG.
+    if (parsed.textOnly) { printTextDiff(parsed); return; }
 
     // --markdown skips HTML viewer generation: the markdown is the deliverable
     // and the viewer would be redundant. Images still render so the markdown
@@ -802,6 +815,26 @@ function repoRootOf(filePath: string): string | null {
     encoding: "utf8",
   });
   return r.status === 0 ? r.stdout.trim() : null;
+}
+
+/** Pin `parsed.fromRef` / `parsed.toRef` to concrete commit SHAs once for
+ *  the whole CLI invocation. Mutating the parsed object propagates the
+ *  pinned values to every downstream consumer (renderProject,
+ *  printTextDiff, buildMarkdownReport) without each having to thread an
+ *  extra parameter. No-op when there are no resolvable inputs, or when
+ *  the input doesn't sit inside a git repo. */
+function pinParsedRefs(parsed: ParsedArgs): void {
+  let files: string[];
+  try {
+    files = resolveInputs(parsed.input, parsed.scope);
+  } catch {
+    return; // resolveInputs throws on bad input; let the dispatcher report it
+  }
+  if (files.length === 0) return;
+  const repoRoot = repoRootOf(files[0]);
+  if (!repoRoot) return;
+  parsed.fromRef = resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD");
+  parsed.toRef = resolveRefToSha(repoRoot, parsed.toRef ?? "");
 }
 
 main();

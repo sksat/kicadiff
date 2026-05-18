@@ -1405,13 +1405,15 @@ export async function renderProject(opts: ProjectRenderOptions): Promise<Project
   // this batch sees the exact same commit — without this, a fast-moving
   // branch could resolve to one commit for the .kicad_pcb render and a
   // different commit for the .kicad_sch render started microseconds later.
-  let pinnedFromRef = opts.fromRef;
-  let pinnedToRef = opts.toRef;
+  // Defaults (HEAD / working tree) must be pinned too: leaving them unset
+  // would let each parallel render() resolve HEAD independently.
+  let pinnedFromRef = opts.fromRef ?? "HEAD";
+  let pinnedToRef = opts.toRef ?? "";
   if (files.length > 0) {
     const repoRoot = getRepoRoot(files[0]);
     if (repoRoot) {
-      if (pinnedFromRef !== undefined) pinnedFromRef = resolveRefToSha(repoRoot, pinnedFromRef);
-      if (pinnedToRef !== undefined) pinnedToRef = resolveRefToSha(repoRoot, pinnedToRef);
+      pinnedFromRef = resolveRefToSha(repoRoot, pinnedFromRef);
+      pinnedToRef = resolveRefToSha(repoRoot, pinnedToRef);
     }
   }
 

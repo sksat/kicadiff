@@ -1166,14 +1166,14 @@ test.describe("ref pinning", () => {
     }
   });
 
-  test("--text-only output stays consistent under a branch rename mid-flight", () => {
+  test("--text-only output is identical across two runs when HEAD advances past --from", () => {
     // We can't deterministically race the branch against a running kicadiff,
     // but we can verify the closest observable: two consecutive --text-only
-    // runs against the same branch produce identical output even when HEAD
-    // (the *target* working tree comparison) sits at a different commit
-    // than the branch. This exercises the same code path that would
-    // misbehave if textdiff resolved the ref twice and got two different
-    // commits in between.
+    // runs against the same `--from feat` ref produce identical output even
+    // though HEAD (the working-tree side) is already a commit ahead of
+    // `feat`. This exercises the same code path that would misbehave if
+    // textdiff resolved the ref twice and got two different commits in
+    // between.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-text-"));
     try {
       initRepoAt(tmp, "init");
