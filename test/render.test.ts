@@ -1012,3 +1012,118 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
     await new Promise((r) => setTimeout(r, 100));
   }
 }
+
+// =============================================================================
+// Ref pinning: mutable refs (branch / tag / HEAD) are resolved to a concrete
+// commit SHA at render entry so every git read (.kicad_pcb, sibling
+// .kicad_pro / .kicad_prl, temp staging) sees the same snapshot — even if
+// the ref moves underneath the running process. The manifest also records
+// the pinned SHA so the report is reproducible after the branch advances.
+// =============================================================================
+
+test.describe("ref pinning", () => {
+  /** Initialise a fresh git repo under `dir` with the blink fixture, commit
+   *  it, and return the resulting commit SHA. */
+  function initRepoAt(dir: string, label: string): string {
+    fs.cpSync(path.dirname(PCB_FILE), dir, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "add", "."], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "commit", "-q", "-m", label], { cwd: dir });
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  }
+
+  test("resolveRefToSha returns a 40-char SHA for HEAD, branches, and tags", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-unit-"));
+    try {
+      const headSha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      execFileSync("git", ["tag", "v1"], { cwd: tmp });
+
+      const { resolveRefToSha } = await import("../src/render.ts");
+      expect(resolveRefToSha(tmp, "HEAD")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "main")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "feat")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "v1")).toBe(headSha);
+      // Idempotent on an already-resolved SHA.
+      expect(resolveRefToSha(tmp, headSha)).toBe(headSha);
+      // Working-tree markers pass through.
+      expect(resolveRefToSha(tmp, "")).toBe("");
+      expect(resolveRefToSha(tmp, "working")).toBe("working");
+      // Non-existent refs throw a clear error.
+      expect(() => resolveRefToSha(tmp, "no-such-ref")).toThrow(/cannot resolve ref/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("manifest records the pinned commit SHA, not the branch name", () => {
+    // When the user passes `--from feat`, the rendered output should be
+    // anchored to whatever commit `feat` pointed at when the render started.
+    // Recording the branch name in the manifest would be a foot-gun: someone
+    // reading the report later (after `feat` has moved) would have no way to
+    // tell which commit was actually compared. So the manifest stores the
+    // resolved 40-char SHA; the viewer/markdown templates shorten it to 7
+    // chars for display.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-manifest-"));
+    try {
+      const initSha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      // Move HEAD forward by editing a value; `feat` stays at initSha.
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      const orig = fs.readFileSync(pcbInTmp, "utf8");
+      fs.writeFileSync(pcbInTmp, orig.replace(/"330"/g, '"470"'));
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-am", "bump R1"], { cwd: tmp });
+      const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, [
+        "pcb", pcbInTmp, "--from", "feat", "--to", "HEAD",
+        "--output-dir", outDir,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const htmls = fs.readdirSync(outDir).filter(f => f.endsWith("_diff.html"));
+      const m = readManifest(path.join(outDir, htmls[0])) as any;
+      const pcb = m.files[0];
+      expect(pcb.fromRef).toBe(initSha);
+      expect(pcb.toRef).toBe(headSha);
+      // Sanity: SHA, not the user-typed names
+      expect(pcb.fromRef).not.toBe("feat");
+      expect(pcb.toRef).not.toBe("HEAD");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("all files in a multi-file project pin to the same SHA", () => {
+    // renderProject pins once up front so the .kicad_pcb and .kicad_sch
+    // entries in a single report agree on which commit they were compared
+    // against — without this, a fast-moving branch could land on different
+    // commits between the two parallel renders.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-project-"));
+    try {
+      const sha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, [
+        tmp, "--from", "feat", "--output-dir", outDir,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const htmls = fs.readdirSync(outDir).filter(f => f.endsWith("_diff.html"));
+      const m = readManifest(path.join(outDir, htmls[0])) as any;
+      expect(m.files.length).toBeGreaterThanOrEqual(2);
+      for (const f of m.files) {
+        expect(f.fromRef).toBe(sha);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

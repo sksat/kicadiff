@@ -313,6 +313,29 @@ manifest 上は file が `after.pages[]` を持つかどうかで page 切替の
 before と after が完了したら manifest に組み立て、HTML / markdown に
 inline する。
 
+### ref pinning
+
+`branch` / `tag` / `HEAD` / `HEAD~N` のような可変な ref は、render に
+入る最初に `git rev-parse <ref>^{commit}` で 40 文字 SHA に解決して
+固定する (`resolveRefToSha`)。1 回の render では git を複数回叩く
+(本体の `.kicad_pcb` / `.kicad_sch` の読み込み、cache key 用の sibling
+`.kicad_pro` / `.kicad_prl` の読み込み、kicad-cli に渡す temp 用に
+もう一度 sibling 読み込み……) ため、その間に ref が動くと別 commit の
+bytes が混ざって kicad-cli にプロジェクトとして矛盾した入力を渡すこと
+になる。先に SHA に pin することで、render 中に branch が force-push
+されたり `git fetch` が走ったりしても、すべての git read が同じ
+スナップショットを見る。
+
+`renderProject` でも一度 pin するので、並列で走る複数ファイルの
+render も同じ commit を見る (`.kicad_pcb` と `.kicad_sch` で別 commit を
+見てしまうのを防ぐ)。`render` 内でも再度 pin するが、すでに 40 文字
+SHA であれば idempotent。
+
+manifest の `fromRef` / `toRef` には pin 済みの SHA を記録する。
+レポートを後から読み直すときに、branch が動いていても「どの commit と
+比較したか」が確定できる。ビューアの `refLabel` と markdown の
+`refLabelMd` がどちらも 40 文字 SHA を 7 文字に短縮して表示する。
+
 ### temp file の lifecycle
 
 git ref から render するとき、kicad-cli は on-disk のファイルパスを

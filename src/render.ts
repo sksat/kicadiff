@@ -152,6 +152,31 @@ function gitReadAtRef(repoRoot: string, ref: string, relPath: string): Buffer | 
   });
 }
 
+/** Pin a (possibly mutable) ref to its current commit SHA.
+ *  Branch names, tag names, "HEAD", "HEAD~1", … all point at commits that
+ *  can move between separate `git show` invocations during a single render
+ *  (someone pushes to the branch, `git fetch` updates a remote-tracking
+ *  branch, a tag is force-recreated, …). Within one render we call git
+ *  several times — once for the .kicad_pcb/.kicad_sch content, then again
+ *  for each sibling .kicad_pro / .kicad_prl, then a third time when writing
+ *  the temp files kicad-cli reads. If the ref moves between those calls we
+ *  silently mix bytes from two different commits.
+ *
+ *  Resolving the ref to a 40-char SHA up front and passing that SHA into
+ *  every subsequent `git show` makes the render atomic against branch
+ *  movement: even if the branch advances mid-render, we keep reading from
+ *  the snapshot we pinned on entry.
+ *
+ *  `""` / `"working"` (the working-tree marker) pass through unchanged. */
+export function resolveRefToSha(repoRoot: string, ref: string): string {
+  if (ref === "" || ref === "working") return ref;
+  const r = spawnSync("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+    encoding: "utf8",
+  });
+  if (r.status !== 0) throw new Error(`cannot resolve ref to commit: ${ref}`);
+  return r.stdout.trim();
+}
+
 // =============================================================================
 // Render output cache
 //
@@ -825,9 +850,25 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
   const beforePng = path.join(outputDir, `before/${safe}.png`);
 
   // --- Resolve refs (git-diff-like semantics) ---
-  // Default: from=HEAD, to=working tree
-  const fromRef = opts.fromRef ?? "HEAD";
-  const toRef = opts.toRef ?? "";
+  // Default: from=HEAD, to=working tree.
+  // Pin mutable refs (branch / tag / HEAD / HEAD~N) to a concrete commit
+  // SHA before doing anything else with git. This render touches git
+  // several times — the file content, each sibling .kicad_pro / .kicad_prl
+  // for the cache key, then those siblings again when staging temps for
+  // kicad-cli. If the ref moves between calls (`git fetch` racing in
+  // another process, a force-push to the branch, …) we'd silently mix
+  // bytes from two commits and feed kicad-cli an inconsistent project,
+  // and the cache entry written from that render would be tainted.
+  // Resolving once and threading the SHA through guarantees every git
+  // read sees the same snapshot, regardless of what the ref does next.
+  // renderProject pins too so all parallel renders share one snapshot;
+  // the second resolution here is idempotent on an already-resolved SHA.
+  const fromRef = repoRoot
+    ? resolveRefToSha(repoRoot, opts.fromRef ?? "HEAD")
+    : (opts.fromRef ?? "HEAD");
+  const toRef = repoRoot
+    ? resolveRefToSha(repoRoot, opts.toRef ?? "")
+    : (opts.toRef ?? "");
   const isWorkingTree = (ref: string) => ref === "" || ref === "working";
 
   /** Render one side. If `ref` is working tree, render filePath directly.
@@ -1069,6 +1110,11 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
     hasDiff = !beforeBuf.equals(afterBuf);
   }
 
+  // Manifest records the pinned SHAs (not the user-typed "HEAD" / "main"):
+  // the diff is anchored to specific commits, so anyone re-reading the
+  // report later — after the branch has moved — can still resolve exactly
+  // what was compared. The viewer's refLabel and the markdown refLabelMd
+  // both shorten 40-char SHAs to 7 chars for display.
   const manifest = buildManifest({
     relPath, fileType, outputDir, safe, hasBefore, hasAfter, hasDiff,
     diffBeforePng, diffAfterPng, schRootName,
@@ -1352,13 +1398,30 @@ export function resolveInputs(
  *  run in parallel — see render(). */
 export async function renderProject(opts: ProjectRenderOptions): Promise<ProjectRenderResult> {
   const files = resolveInputs(opts.input, opts.scope);
+
+  // Pin mutable refs (branch / tag / HEAD) to their current commit SHAs
+  // once for the whole project. Each render() also pins internally as a
+  // safety net, but doing it here too means every parallel file render in
+  // this batch sees the exact same commit — without this, a fast-moving
+  // branch could resolve to one commit for the .kicad_pcb render and a
+  // different commit for the .kicad_sch render started microseconds later.
+  let pinnedFromRef = opts.fromRef;
+  let pinnedToRef = opts.toRef;
+  if (files.length > 0) {
+    const repoRoot = getRepoRoot(files[0]);
+    if (repoRoot) {
+      if (pinnedFromRef !== undefined) pinnedFromRef = resolveRefToSha(repoRoot, pinnedFromRef);
+      if (pinnedToRef !== undefined) pinnedToRef = resolveRefToSha(repoRoot, pinnedToRef);
+    }
+  }
+
   const results: RenderResult[] = await Promise.all(
     files.map(file =>
       render({
         filePath: file,
         outputDir: opts.outputDir,
-        fromRef: opts.fromRef,
-        toRef: opts.toRef,
+        fromRef: pinnedFromRef,
+        toRef: pinnedToRef,
         imagesOnly: true, // we'll generate one combined HTML below
         noCache: opts.noCache,
       }),
