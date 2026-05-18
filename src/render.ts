@@ -173,7 +173,22 @@ export function resolveRefToSha(repoRoot: string, ref: string): string {
   const r = spawnSync("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
     encoding: "utf8",
   });
-  if (r.status !== 0) throw new Error(`cannot resolve ref to commit: ${ref}`);
+  // `spawnSync` fails in two distinct shapes we must surface differently:
+  //   - r.error set (status === null): the process didn't run at all
+  //     (git missing from PATH, repoRoot unreadable, …). Reporting this as
+  //     "cannot resolve ref" would point users at their ref when the real
+  //     problem is the environment.
+  //   - non-zero exit: git ran but rejected the ref. The `--quiet` flag
+  //     suppresses git's own stderr, so we phrase the user-facing message.
+  if (r.error) {
+    throw new Error(`git rev-parse failed for ref "${ref}" in ${repoRoot}: ${r.error.message}`);
+  }
+  if (r.status !== 0) {
+    const detail = (r.stderr ?? "").trim();
+    throw new Error(detail
+      ? `cannot resolve ref to commit: ${ref} (${detail})`
+      : `cannot resolve ref to commit: ${ref}`);
+  }
   return r.stdout.trim();
 }
 

@@ -1201,4 +1201,56 @@ test.describe("ref pinning", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  test("--text-only pinning still works when the input file's directory no longer exists", () => {
+    // resolveInputs explicitly allows files that have been deleted from
+    // the working tree (still present at a ref). When the deletion took
+    // the file's parent directory with it, naively running `git -C
+    // <parent>` fails — but the repo itself is still reachable from
+    // farther up the tree. repoRootOf walks up to the first existing
+    // directory so ref pinning still finds the repo for this flow.
+    //
+    // Exercised via --text-only because the render path also tries to
+    // write a temp file beside the (now-missing) input dir, which is a
+    // separate concern; the ref-pinning fix is independent and lives in
+    // repoRootOf / pinParsedRefs.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-deleted-"));
+    try {
+      // Commit a PCB inside a subdirectory, then `git rm` it (and remove
+      // the subdir entirely) so the working tree no longer contains
+      // either the file or its parent.
+      const sub = path.join(tmp, "boards");
+      fs.mkdirSync(sub);
+      fs.cpSync(PCB_FILE, path.join(sub, path.basename(PCB_FILE)));
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "add", "."], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: tmp });
+      execFileSync("git", ["rm", "-rq", "boards"], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "drop boards"], { cwd: tmp });
+      const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+      const beforeSha = execFileSync("git", ["rev-parse", "HEAD~1"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+
+      const deletedPcb = path.join(sub, path.basename(PCB_FILE));
+      const r = spawnSync(CLI, [
+        "--text-only", "--from", "HEAD~1", "--to", "HEAD", deletedPcb,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(0);
+      // The boards/ dir is gone but the repo isn't. Without the walk-up
+      // fix repoRootOf returned null → both sides of textdiff resolved
+      // to "no content" → the summary line read `+0 -0 ~0 =0`. With the
+      // fix we find the repo, read the before-side from HEAD~1, and the
+      // removed-component count is non-zero (every component in the PCB
+      // was deleted along with the file).
+      expect(r.stdout).toMatch(/-[1-9]\d* ~\d+ =\d+/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

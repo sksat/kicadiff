@@ -810,8 +810,20 @@ function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): v
 }
 
 function repoRootOf(filePath: string): string | null {
-  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], {
-    cwd: filePath.replace(/\/[^/]*$/, "") || ".",
+  // Walk up from the file's parent until we find an existing directory.
+  // `resolveInputs` allows files that no longer exist on disk (deleted on
+  // one side of the diff but still present at a ref) — in that case the
+  // immediate parent dir may not exist anymore even though the repo does,
+  // and a `git -C <missing>` would fail. Mirrors getRepoRoot() in
+  // src/render.ts so the deleted-file flow doesn't silently skip ref
+  // pinning.
+  let dir = path.dirname(filePath);
+  while (!fs.existsSync(dir)) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const r = spawnSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   });
   return r.status === 0 ? r.stdout.trim() : null;
