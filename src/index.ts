@@ -3,7 +3,11 @@
  * kicadiff CLI entry point.
  *
  * Usage (git diff-compatible):
- *   kicadiff                                 cwd as input (combined PCB+sch)
+ *   kicadiff                                 cwd as input (combined PCB+sch).
+ *                                            Default = index (`:0`) vs working
+ *                                            tree, same as bare `git diff`.
+ *   kicadiff --cached / --staged             HEAD vs index (same as
+ *                                            `git diff --cached`).
  *   kicadiff <input>                         <input> = file/dir/.kicad_pro
  *   kicadiff <ref> <input>                   Compare working tree vs <ref>
  *   kicadiff <r1> <r2> <input>               Compare <r1> vs <r2>
@@ -13,6 +17,9 @@
  *   kicadiff hook                            Read PostToolUse JSON from stdin
  *                                            and render if a KiCad file was
  *                                            edited (Claude Code integration).
+ *
+ * Special refs: `:0` (or `index` / `staged`) reads the git index — same
+ * notation as `git show :0:path`. `""` / `"working"` means the working tree.
  */
 
 import { spawnSync } from "node:child_process";
@@ -59,9 +66,18 @@ Refs (positional, git diff-compatible):
   <r1>..<r2>        Same as above (range syntax)             (1 ref token)
   --                Separator: refs before, input after
 
+  Special ref names: \`:0\` (or \`index\` / \`staged\`) reads the git index —
+  same notation as \`git show :0:path\`. \`working\` (or the empty toRef)
+  means the working tree. Bare \`kicadiff\` defaults to \`:0\` vs working,
+  matching \`git diff\`.
+
 Options:
   --from <ref>           Base ref (alternative to positional)
   --to <ref>             Target ref (alternative to positional; default: working tree)
+  --cached, --staged     Compare HEAD vs the index (same as \`git diff --cached\`).
+                         Equivalent to \`--from HEAD --to :0\`. A positional
+                         \`<ref>\` combined with --cached overrides the default
+                         from (so \`kicadiff --cached main\` is main vs index).
   --output-dir <dir>     Image output directory (default: <repo>/.claude/preview)
   -o, --output <path>    Output file path. Default: <output-dir>/<name>_diff.html
                          (or .md with --markdown). Image paths in the file are
@@ -105,7 +121,9 @@ Env:
                          appended; empty string = no-op). Useful for testing.
 
 Examples:
-  kicadiff                              # cwd, combined PCB+sch vs HEAD
+  kicadiff                              # cwd, combined PCB+sch — index vs working
+  kicadiff --cached                     # HEAD vs index (staged-only delta)
+  kicadiff HEAD project/                # working tree vs HEAD (staged + unstaged)
   kicadiff project/                     # both files in project/
   kicadiff foo.kicad_pcb                # foo.kicad_pcb + sibling foo.kicad_sch
   kicadiff main project/                # working tree vs main
@@ -200,9 +218,21 @@ function isLikelyInput(s: string): boolean {
   return false;
 }
 
+/** Canonical form of the git index marker. `git show :0:path` reads stage 0
+ *  of the index for `path` — same notation we use throughout. */
+const INDEX_REF = ":0";
+
+/** True if `s` is one of the accepted spellings for the git index. We
+ *  normalise to `INDEX_REF` everywhere downstream so manifest output and
+ *  comparison are consistent regardless of which spelling the user typed. */
+function isIndexAlias(s: string): boolean {
+  return s === ":0" || s === "index" || s === "staged";
+}
+
 /** Validate a string is a usable git ref. */
 function isLikelyValidRef(ref: string): boolean {
   if (ref === "" || ref === "working") return true;
+  if (isIndexAlias(ref)) return true;
   const r = spawnSync("git", ["rev-parse", "--verify", "--quiet", ref + "^{}"], {
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -248,6 +278,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let noCache = false;
   let open: string | undefined;
   let watch = false;
+  let cached = false;
 
   for (; i < argv.length; i++) {
     const arg = argv[i];
@@ -290,6 +321,10 @@ function parseArgs(argv: string[]): ParsedArgs {
       noCache = true;
     } else if (arg === "--watch") {
       watch = true;
+    } else if (arg === "--cached" || arg === "--staged") {
+      // `git diff --cached` semantics: compare HEAD against the index.
+      // Explicit --from / --to / positional refs still win.
+      cached = true;
     } else if (arg === "--verbose" || arg === "-v" || arg === "--debug") {
       logLevel = "debug";
     } else if (arg === "--quiet" || arg === "-q") {
@@ -347,7 +382,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  // Expand `<r1>..<r2>` range
+  // Expand `<r1>..<r2>` range, then normalise index aliases (`index` /
+  // `staged` → `:0`) so the rest of the pipeline only ever sees the
+  // canonical form.
   const expandedRefs: string[] = [];
   for (const tok of refTokens) {
     const dotIdx = tok.indexOf("..");
@@ -357,10 +394,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       expandedRefs.push(tok);
     }
   }
+  for (let j = 0; j < expandedRefs.length; j++) {
+    if (isIndexAlias(expandedRefs[j])) expandedRefs[j] = INDEX_REF;
+  }
 
   // Map positional refs to from/to
   if (expandedRefs.length === 0) {
-    // Defaults: from=HEAD, to=working
+    // Defaults applied below (depending on --cached, otherwise index vs working)
   } else if (expandedRefs.length === 1) {
     if (fromRef === undefined) fromRef = expandedRefs[0];
   } else if (expandedRefs.length === 2) {
@@ -371,6 +411,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       `too many ref arguments (max 2, got ${expandedRefs.length}): ${expandedRefs.join(" ")}`,
     );
   }
+
+  // --cached / --staged switches the "to" side to the index. Mirrors
+  // `git diff --cached`: bare flag = HEAD vs index, `--cached <ref>` =
+  // <ref> vs index. Explicit --from / --to / a 2-ref positional pair win.
+  if (cached) {
+    if (fromRef === undefined) fromRef = "HEAD";
+    if (toRef === undefined) toRef = INDEX_REF;
+  }
+
+  // Normalise --from / --to aliases too (so `--from index` works).
+  if (fromRef !== undefined && isIndexAlias(fromRef)) fromRef = INDEX_REF;
+  if (toRef !== undefined && isIndexAlias(toRef)) toRef = INDEX_REF;
 
   if (fromRef !== undefined && !isLikelyValidRef(fromRef)) {
     throw new Error(`bad ref: ${fromRef}`);
@@ -574,8 +626,8 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
   // each file twice (before + after), and across multiple files in a batch
   // we'd issue many more reads — same race as the render path, same fix.
   const fromRef = repoRoot
-    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
-    : (parsed.fromRef ?? "HEAD");
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? INDEX_REF)
+    : (parsed.fromRef ?? INDEX_REF);
   const toRef = repoRoot
     ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
     : (parsed.toRef ?? "");
@@ -588,9 +640,11 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
 }
 
 /** Format a friendly ref label for markdown headings. Mirrors the viewer's
- *  refLabel: empty/missing toRef → "working tree", full SHAs → 7-char short. */
+ *  refLabel: empty/missing toRef → "working tree", `:0` → "index",
+ *  full SHAs → 7-char short. */
 function refLabelMd(ref: string): string {
   if (!ref) return "working tree";
+  if (ref === INDEX_REF) return "index";
   if (/^[0-9a-f]{40}$/i.test(ref)) return ref.slice(0, 7);
   return ref;
 }
@@ -674,8 +728,8 @@ function buildMarkdownReport(
   // component list could be computed against different commits if the
   // branch moved between the render and the report.
   const fromRef = repoRoot
-    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
-    : (parsed.fromRef ?? "HEAD");
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? INDEX_REF)
+    : (parsed.fromRef ?? INDEX_REF);
   const toRef = repoRoot
     ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
     : (parsed.toRef ?? "");
@@ -845,7 +899,10 @@ function pinParsedRefs(parsed: ParsedArgs): void {
   if (files.length === 0) return;
   const repoRoot = repoRootOf(files[0]);
   if (!repoRoot) return;
-  parsed.fromRef = resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD");
+  // Default: from=index (":0"), to=working — matches `git diff` rather than
+  // `git diff HEAD`. Index and working-tree markers pass through
+  // resolveRefToSha unchanged; only branch/tag/SHA-ish refs get pinned.
+  parsed.fromRef = resolveRefToSha(repoRoot, parsed.fromRef ?? INDEX_REF);
   parsed.toRef = resolveRefToSha(repoRoot, parsed.toRef ?? "");
 }
 

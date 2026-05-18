@@ -167,9 +167,13 @@ function gitReadAtRef(repoRoot: string, ref: string, relPath: string): Buffer | 
  *  movement: even if the branch advances mid-render, we keep reading from
  *  the snapshot we pinned on entry.
  *
- *  `""` / `"working"` (the working-tree marker) pass through unchanged. */
+ *  `""` / `"working"` (the working-tree marker) and `":0"` (the index
+ *  marker) pass through unchanged — they don't correspond to a commit,
+ *  and pinning to a snapshot doesn't apply the same way (a concurrent
+ *  `git add` during the render is the same kind of race we already accept
+ *  for working-tree reads). */
 export function resolveRefToSha(repoRoot: string, ref: string): string {
-  if (ref === "" || ref === "working") return ref;
+  if (ref === "" || ref === "working" || ref === ":0") return ref;
   const r = spawnSync("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
     encoding: "utf8",
   });
@@ -865,7 +869,8 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
   const beforePng = path.join(outputDir, `before/${safe}.png`);
 
   // --- Resolve refs (git-diff-like semantics) ---
-  // Default: from=HEAD, to=working tree.
+  // Default: from=index (":0"), to=working tree — matches `git diff`
+  // (index vs working tree) rather than `git diff HEAD` (HEAD vs working).
   // Pin mutable refs (branch / tag / HEAD / HEAD~N) to a concrete commit
   // SHA before doing anything else with git. This render touches git
   // several times — the file content, each sibling .kicad_pro / .kicad_prl
@@ -878,9 +883,11 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
   // read sees the same snapshot, regardless of what the ref does next.
   // renderProject pins too so all parallel renders share one snapshot;
   // the second resolution here is idempotent on an already-resolved SHA.
+  // `:0` (index) and `""` / `"working"` pass through unchanged — neither
+  // names a commit, so there's no SHA to pin to.
   const fromRef = repoRoot
-    ? resolveRefToSha(repoRoot, opts.fromRef ?? "HEAD")
-    : (opts.fromRef ?? "HEAD");
+    ? resolveRefToSha(repoRoot, opts.fromRef ?? ":0")
+    : (opts.fromRef ?? ":0");
   const toRef = repoRoot
     ? resolveRefToSha(repoRoot, opts.toRef ?? "")
     : (opts.toRef ?? "");
@@ -1420,9 +1427,9 @@ export async function renderProject(opts: ProjectRenderOptions): Promise<Project
   // this batch sees the exact same commit — without this, a fast-moving
   // branch could resolve to one commit for the .kicad_pcb render and a
   // different commit for the .kicad_sch render started microseconds later.
-  // Defaults (HEAD / working tree) must be pinned too: leaving them unset
-  // would let each parallel render() resolve HEAD independently.
-  let pinnedFromRef = opts.fromRef ?? "HEAD";
+  // Defaults (index / working tree) must be pinned too: leaving them unset
+  // would let each parallel render() resolve independently.
+  let pinnedFromRef = opts.fromRef ?? ":0";
   let pinnedToRef = opts.toRef ?? "";
   if (files.length > 0) {
     const repoRoot = getRepoRoot(files[0]);
