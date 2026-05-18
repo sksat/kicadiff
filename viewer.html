@@ -591,16 +591,18 @@ document.addEventListener('mouseup', () => {
 
 /* Render a friendly label for a git ref. Used in pane labels and the
    overlay/swipe legends. Empty/unset toRef means "working tree" (the
-   default — uncommitted edits in the file). */
+   default — uncommitted edits in the file). `:0` is the git index marker
+   (`git show :0:path`), rendered as "index" for the reviewer. */
 function refLabel(ref) {
   if (ref === undefined || ref === null || ref === '') return 'working tree';
+  if (ref === ':0') return 'index';
   // Truncate full 40-char SHAs to 7 chars (git short-style); leave named
   // refs (HEAD, main, tag names) untouched.
   if (/^[0-9a-f]{40}$/i.test(ref)) return ref.slice(0, 7);
   return ref;
 }
 
-const FROM_LABEL = () => refLabel(M.fromRef ?? 'HEAD');
+const FROM_LABEL = () => refLabel(M.fromRef ?? ':0');
 const TO_LABEL = () => refLabel(M.toRef ?? '');
 
 // --- Build views ---

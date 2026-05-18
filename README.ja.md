@@ -59,7 +59,8 @@ curl -fsSL https://raw.githubusercontent.com/sksat/kicadiff/main/install.sh | sh
 ときのために subcommand がある。
 
 ```sh
-# プロジェクト全体の diff (cwd 内、PCB と schematic 両方、デフォルトは HEAD vs working tree)
+# プロジェクト全体の diff (cwd 内、PCB と schematic 両方、デフォルトは
+# index vs working tree — `git diff` と同じ)
 kicadiff
 
 # プロジェクトディレクトリ / .kicad_pro / 単一の KiCad ファイルを渡す
@@ -67,11 +68,17 @@ kicadiff path/to/project/
 kicadiff project.kicad_pro
 kicadiff project.kicad_pcb
 
+# staged な変更のみ (= `git diff --cached` / `git diff --staged`)
+kicadiff --cached project/
+kicadiff --staged project/             # alias
+
 # 任意の ref を比較
+kicadiff HEAD path/to/project/         # working tree vs HEAD (staged + unstaged 全部)
 kicadiff main path/to/project/         # working tree vs main
 kicadiff v1.0 v2.0 board.kicad_pcb     # v1.0 vs v2.0
 kicadiff main..feat foo.kicad_pcb      # range syntax
 kicadiff main -- foo.kicad_pcb         # 明示的な `--` separator
+kicadiff :0 project/                   # 明示的に index 指定 (alias: index / staged)
 
 # Subcommand でファイル型を限定 (sibling の自動検出を無効化)
 kicadiff pcb foo.kicad_pcb

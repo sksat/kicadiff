@@ -58,7 +58,8 @@ first, then pick whichever kicadiff distribution form fits your workflow.
 plus a few subcommands when you want to scope to one file type.
 
 ```sh
-# Project-level diff (cwd, both PCB and schematic, default = HEAD vs working tree)
+# Project-level diff (cwd, both PCB and schematic, default = index vs working
+# tree — same as `git diff`)
 kicadiff
 
 # Pass a project root, a .kicad_pro, or any single KiCad file
@@ -66,11 +67,17 @@ kicadiff path/to/project/
 kicadiff project.kicad_pro
 kicadiff project.kicad_pcb
 
+# Staged changes only (same as `git diff --cached` / `git diff --staged`)
+kicadiff --cached project/
+kicadiff --staged project/             # alias
+
 # Compare arbitrary refs
+kicadiff HEAD path/to/project/         # working tree vs HEAD (includes staged)
 kicadiff main path/to/project/         # working tree vs main
 kicadiff v1.0 v2.0 board.kicad_pcb     # v1.0 vs v2.0
 kicadiff main..feat foo.kicad_pcb      # range syntax
 kicadiff main -- foo.kicad_pcb         # explicit `--` separator
+kicadiff :0 project/                   # explicit index ref (alias: index / staged)
 
 # Subcommands scope to one file type (skip sibling auto-detect)
 kicadiff pcb foo.kicad_pcb

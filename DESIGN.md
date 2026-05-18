@@ -135,13 +135,31 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
 positional argument を分類する:
 
 - 識別: subcommand (`pcb` 等) → scope を限定
-- 識別: `--from` / `--to` / `--output` などの flag
+- 識別: `--from` / `--to` / `--output` / `--cached` / `--staged` などの flag
 - 残りの positional から `isLikelyInput()` で input を逆引き
   (拡張子 / `/` の有無で判定)
 - 残りの positional は ref と見做し、`<r1>..<r2>` 記法を expand
+- index の別名 (`:0` / `index` / `staged`) は canonical な `:0` に正規化
 - ref は `git rev-parse --verify` で先に validate
+  (`:0` / `""` / `"working"` はリテラルとして許容)
 
 `--` separator で input と ref を明示分離することも可能 (git と同じ)。
+
+### デフォルトと特殊 ref
+
+| ref 表現 | 意味 |
+|---|---|
+| `""` / `"working"` | working tree (filesystem 上の現状) |
+| `":0"` / `"index"` / `"staged"` | git index (`git show :0:path` と同じ) |
+| `"HEAD"` / branch / tag / SHA | 通常の git ref |
+
+bare `kicadiff` は `git diff` 互換: **from=`:0`, to=working tree**。
+`--cached` / `--staged` で **from=HEAD, to=`:0`** に切替 (= `git diff --cached`)。
+
+`resolveRefToSha` は `:0` / `""` / `"working"` を **そのまま素通し** し、
+通常 ref のみ SHA に pin する。index と working tree は commit に対応
+しないため pinning の対象外 (途中で `git add` が走る race window は
+working tree と同じ前提で受け入れる)。
 
 ## ビューア (`viewer.html`)
 
@@ -215,8 +233,8 @@ FileManifest {
   type: "pcb" | "sch" | "sym" | "fp";
   hasBefore: boolean;
   hasDiff?: boolean;     // before/after combined PNG が byte 単位で違うか
-  fromRef?: string;      // 比較元の ref (default: "HEAD")
-  toRef?: string;        // 比較先の ref ("" = working tree)
+  fromRef?: string;      // 比較元の ref (default: ":0" = index)
+  toRef?: string;        // 比較先の ref ("" = working tree, ":0" = index)
   after: SideManifest;
   before?: SideManifest; // hasBefore のときのみ
   diff?: { before: string; after: string };

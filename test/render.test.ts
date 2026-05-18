@@ -301,16 +301,166 @@ test.describe("Schematic rendering", () => {
 // =============================================================================
 
 test.describe("Git ref handling", () => {
-  test("--from HEAD --to working tree (default) works", () => {
+  test("renders before + after PNGs for the default invocation", () => {
     runCli([PCB_FILE, "--output-dir", outputDir]);
     expect(fs.existsSync(path.join(outputDir, `before/${SAFE_PCB}.png`))).toBe(true);
     expect(fs.existsSync(path.join(outputDir, `after/${SAFE_PCB}.png`))).toBe(true);
   });
 
-  test("explicit --from HEAD produces same result as default", () => {
+  test("explicit `--from HEAD` renders both sides", () => {
     runCli([PCB_FILE, "--from", "HEAD", "--output-dir", outputDir]);
     const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
     expect(m.files.every((f: any) => f.hasBefore === true)).toBe(true);
+  });
+});
+
+// =============================================================================
+// `git diff`-compatible defaults: bare `kicadiff` compares index vs working
+// tree (same as `git diff`), not HEAD vs working tree. `--cached` / `--staged`
+// flip to HEAD vs index (same as `git diff --cached`). The index is reachable
+// through `:0` (or the `index` / `staged` aliases) as a positional ref too.
+// =============================================================================
+
+test.describe("git diff-compatible defaults", () => {
+  /** Initialise a repo with the blink fixture committed and return its SHA. */
+  function initRepoWithBlink(dir: string): string {
+    fs.cpSync(path.dirname(PCB_FILE), dir, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "add", "."], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: dir });
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: dir, encoding: "utf8",
+    }).trim();
+  }
+
+  test("default is index (`:0`) vs working tree, matching `git diff`", () => {
+    runCli([PCB_FILE, "--output-dir", outputDir]);
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(m.files[0].fromRef).toBe(":0");
+    expect(m.files[0].toRef).toBe("");
+  });
+
+  test("staged edits are hidden from the default view (staged == working)", () => {
+    // Stage a change, run default kicadiff. Since index now matches the
+    // working tree, no visual diff should show — same as `git diff` printing
+    // nothing for a fully-staged change.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-staged-noop-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["add", "."], { cwd: tmp });
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, ["pcb", pcbInTmp, "--output-dir", outDir],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const m = readManifest(path.join(outDir,
+        fs.readdirSync(outDir).find((f) => f.endsWith("_diff.html"))!)) as any;
+      expect(m.files[0].hasDiff).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("default shows only the unstaged delta when a staged commit also exists", () => {
+    // Stage one change (330 → 470), then make another unstaged change
+    // (470 → 1k). `git diff` would only print 470 → 1k. Same here.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-staged-then-edit-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["add", "."], { cwd: tmp });
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"470"/g, '"1k"'));
+
+      const r = spawnSync(CLI, ["--text-only", pcbInTmp],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(0);
+      // Unstaged delta (470 → 1k) shows
+      expect(r.stdout).toMatch(/470 → 1k/);
+      // Staged delta (330 → 470) is hidden
+      expect(r.stdout).not.toMatch(/330 → 470/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("`--cached` shows the staged delta (HEAD vs index)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-cached-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["add", "."], { cwd: tmp });
+      // Further unstaged edit that must NOT appear in --cached output
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"470"/g, '"1k"'));
+
+      const r = spawnSync(CLI, ["--text-only", "--cached", pcbInTmp],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/330 → 470/);
+      expect(r.stdout).not.toMatch(/470 → 1k/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("`--staged` is an alias for `--cached`", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-staged-alias-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["add", "."], { cwd: tmp });
+
+      const cached = spawnSync(CLI, ["--text-only", "--cached", pcbInTmp],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const staged = spawnSync(CLI, ["--text-only", "--staged", pcbInTmp],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(cached.status).toBe(0);
+      expect(staged.status).toBe(0);
+      expect(cached.stdout).toBe(staged.stdout);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("positional `:0` is accepted as the index ref", () => {
+    runCli([":0", PCB_FILE, "--output-dir", outputDir]);
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(m.files[0].fromRef).toBe(":0");
+    expect(m.files[0].toRef).toBe("");
+  });
+
+  test("`index` is accepted as a positional alias for `:0`", () => {
+    runCli(["index", PCB_FILE, "--output-dir", outputDir]);
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(m.files[0].fromRef).toBe(":0");
+  });
+
+  test("`staged` is accepted as a positional alias for `:0`", () => {
+    runCli(["staged", PCB_FILE, "--output-dir", outputDir]);
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(m.files[0].fromRef).toBe(":0");
+  });
+
+  test("`kicadiff HEAD <file>` still produces HEAD vs working tree", () => {
+    // Old default behavior is still reachable explicitly. fromRef is pinned
+    // to a 40-char SHA (HEAD resolves to a commit), not the literal "HEAD".
+    runCli(["HEAD", PCB_FILE, "--output-dir", outputDir]);
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(m.files[0].fromRef).toMatch(/^[0-9a-f]{40}$/);
+    expect(m.files[0].toRef).toBe("");
   });
 });
 
@@ -619,12 +769,11 @@ test.describe("--md templating", () => {
   test("default templates produce the bundled report layout", () => {
     const md = runMd([]);
     // Sanity check the recognizable structure of the bundled default:
-    // a `## ` heading per file, the side-by-side image table. The "before"
-    // label is the pinned commit short-SHA (refs get resolved before any
-    // git read), so we match against the 7-char hex shape rather than the
-    // literal "HEAD" the user typed.
+    // a `## ` heading per file, the side-by-side image table. With the
+    // git-diff-compatible default (index vs working tree) the "before"
+    // label is "index", not a commit SHA.
     expect(md).toMatch(/^## `.+\.kicad_pcb` \(pcb\)/m);
-    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \(index\) \| After \(working tree\) \|/);
     // Trailing newline (so the file has a clean POSIX-style ending).
     expect(md.endsWith("\n")).toBe(true);
   });
@@ -636,14 +785,12 @@ test.describe("--md templating", () => {
       "# Diff: {{from_label}} → {{to_label}}\n\nfile_count={{file_count}}\n\n{{file_sections}}\n",
     );
     const md = runMd(["--md-template", tplPath]);
-    // {{from_label}} = pinned short-SHA (refs get resolved at the boundary
-    // so the report reproduces against the exact commit, not whatever the
-    // ref points at later).
-    expect(md).toMatch(/^# Diff: [0-9a-f]{7} → working tree$/m);
+    // {{from_label}} = "index" for the default (index vs working tree).
+    expect(md).toMatch(/^# Diff: index → working tree$/m);
     expect(md).toContain("file_count=2");
     // Default file template is still in effect, so the side-by-side table
     // should still appear inside the wrapped output.
-    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \(index\) \| After \(working tree\) \|/);
   });
 
   test("--md-file-template overrides per-file rendering", () => {
