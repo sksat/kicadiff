@@ -619,9 +619,12 @@ test.describe("--md templating", () => {
   test("default templates produce the bundled report layout", () => {
     const md = runMd([]);
     // Sanity check the recognizable structure of the bundled default:
-    // a `## ` heading per file, the side-by-side image table.
+    // a `## ` heading per file, the side-by-side image table. The "before"
+    // label is the pinned commit short-SHA (refs get resolved before any
+    // git read), so we match against the 7-char hex shape rather than the
+    // literal "HEAD" the user typed.
     expect(md).toMatch(/^## `.+\.kicad_pcb` \(pcb\)/m);
-    expect(md).toMatch(/\| Before \(HEAD\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
     // Trailing newline (so the file has a clean POSIX-style ending).
     expect(md.endsWith("\n")).toBe(true);
   });
@@ -633,11 +636,14 @@ test.describe("--md templating", () => {
       "# Diff: {{from_label}} → {{to_label}}\n\nfile_count={{file_count}}\n\n{{file_sections}}\n",
     );
     const md = runMd(["--md-template", tplPath]);
-    expect(md).toContain("# Diff: HEAD → working tree");
+    // {{from_label}} = pinned short-SHA (refs get resolved at the boundary
+    // so the report reproduces against the exact commit, not whatever the
+    // ref points at later).
+    expect(md).toMatch(/^# Diff: [0-9a-f]{7} → working tree$/m);
     expect(md).toContain("file_count=2");
     // Default file template is still in effect, so the side-by-side table
     // should still appear inside the wrapped output.
-    expect(md).toMatch(/\| Before \(HEAD\) \| After \(working tree\) \|/);
+    expect(md).toMatch(/\| Before \([0-9a-f]{7}\) \| After \(working tree\) \|/);
   });
 
   test("--md-file-template overrides per-file rendering", () => {
@@ -1012,3 +1018,239 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
     await new Promise((r) => setTimeout(r, 100));
   }
 }
+
+// =============================================================================
+// Ref pinning: mutable refs (branch / tag / HEAD) are resolved to a concrete
+// commit SHA at render entry so every git read (.kicad_pcb, sibling
+// .kicad_pro / .kicad_prl, temp staging) sees the same snapshot — even if
+// the ref moves underneath the running process. The manifest also records
+// the pinned SHA so the report is reproducible after the branch advances.
+// =============================================================================
+
+test.describe("ref pinning", () => {
+  /** Initialise a fresh git repo under `dir` with the blink fixture, commit
+   *  it, and return the resulting commit SHA. */
+  function initRepoAt(dir: string, label: string): string {
+    fs.cpSync(path.dirname(PCB_FILE), dir, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "add", "."], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "commit", "-q", "-m", label], { cwd: dir });
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  }
+
+  test("resolveRefToSha returns a 40-char SHA for HEAD, branches, and tags", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-unit-"));
+    try {
+      const headSha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      execFileSync("git", ["tag", "v1"], { cwd: tmp });
+
+      const { resolveRefToSha } = await import("../src/render.ts");
+      expect(resolveRefToSha(tmp, "HEAD")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "main")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "feat")).toBe(headSha);
+      expect(resolveRefToSha(tmp, "v1")).toBe(headSha);
+      // Idempotent on an already-resolved SHA.
+      expect(resolveRefToSha(tmp, headSha)).toBe(headSha);
+      // Working-tree markers pass through.
+      expect(resolveRefToSha(tmp, "")).toBe("");
+      expect(resolveRefToSha(tmp, "working")).toBe("working");
+      // Non-existent refs throw a clear error.
+      expect(() => resolveRefToSha(tmp, "no-such-ref")).toThrow(/cannot resolve ref/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("manifest records the pinned commit SHA, not the branch name", () => {
+    // When the user passes `--from feat`, the rendered output should be
+    // anchored to whatever commit `feat` pointed at when the render started.
+    // Recording the branch name in the manifest would be a foot-gun: someone
+    // reading the report later (after `feat` has moved) would have no way to
+    // tell which commit was actually compared. So the manifest stores the
+    // resolved 40-char SHA; the viewer/markdown templates shorten it to 7
+    // chars for display.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-manifest-"));
+    try {
+      const initSha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      // Move HEAD forward by editing a value; `feat` stays at initSha.
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      const orig = fs.readFileSync(pcbInTmp, "utf8");
+      fs.writeFileSync(pcbInTmp, orig.replace(/"330"/g, '"470"'));
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-am", "bump R1"], { cwd: tmp });
+      const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, [
+        "pcb", pcbInTmp, "--from", "feat", "--to", "HEAD",
+        "--output-dir", outDir,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const htmls = fs.readdirSync(outDir).filter(f => f.endsWith("_diff.html"));
+      const m = readManifest(path.join(outDir, htmls[0])) as any;
+      const pcb = m.files[0];
+      expect(pcb.fromRef).toBe(initSha);
+      expect(pcb.toRef).toBe(headSha);
+      // Sanity: SHA, not the user-typed names
+      expect(pcb.fromRef).not.toBe("feat");
+      expect(pcb.toRef).not.toBe("HEAD");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("all files in a multi-file project pin to the same SHA", () => {
+    // renderProject pins once up front so the .kicad_pcb and .kicad_sch
+    // entries in a single report agree on which commit they were compared
+    // against — without this, a fast-moving branch could land on different
+    // commits between the two parallel renders.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-project-"));
+    try {
+      const sha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, [
+        tmp, "--from", "feat", "--output-dir", outDir,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const htmls = fs.readdirSync(outDir).filter(f => f.endsWith("_diff.html"));
+      const m = readManifest(path.join(outDir, htmls[0])) as any;
+      expect(m.files.length).toBeGreaterThanOrEqual(2);
+      for (const f of m.files) {
+        expect(f.fromRef).toBe(sha);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--md report shows short-SHA labels for branch refs (not the branch name)", () => {
+    // The render path pins refs and stores SHAs in the manifest; the
+    // markdown path (buildMarkdownReport) needs to pin too so the headings
+    // it generates agree with the images. The shared display rule is
+    // refLabelMd: 40-char SHA → 7-char short. Branches get pinned first,
+    // so a `--from feat` invocation shows "Before (<7 hex>)", not
+    // "Before (feat)".
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-md-"));
+    try {
+      const sha = initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+
+      const outDir = path.join(tmp, "out");
+      const mdOut = path.join(tmp, "md-out");
+      fs.mkdirSync(mdOut);
+      const r = spawnSync(CLI, [
+        "pcb", path.join(tmp, path.basename(PCB_FILE)),
+        "--from", "feat", "--output-dir", outDir, "--md", "--output", mdOut,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      if (r.status !== 0) throw new Error(`kicadiff failed: ${r.stderr}`);
+
+      const md = fs.readFileSync(
+        path.join(mdOut, fs.readdirSync(mdOut).find(f => f.endsWith(".md"))!),
+        "utf8",
+      );
+      // Short SHA appears in the heading; the literal "feat" must not.
+      expect(md).toContain(`(${sha.slice(0, 7)})`);
+      expect(md).not.toContain("(feat)");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--text-only output is identical across two runs when HEAD advances past --from", () => {
+    // We can't deterministically race the branch against a running kicadiff,
+    // but we can verify the closest observable: two consecutive --text-only
+    // runs against the same `--from feat` ref produce identical output even
+    // though HEAD (the working-tree side) is already a commit ahead of
+    // `feat`. This exercises the same code path that would misbehave if
+    // textdiff resolved the ref twice and got two different commits in
+    // between.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-text-"));
+    try {
+      initRepoAt(tmp, "init");
+      execFileSync("git", ["branch", "feat"], { cwd: tmp });
+      // Move HEAD forward — `feat` stays put.
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      fs.writeFileSync(pcbInTmp,
+        fs.readFileSync(pcbInTmp, "utf8").replace(/"330"/g, '"470"'));
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-am", "bump"], { cwd: tmp });
+
+      const run = () => spawnSync(CLI, [
+        "--text-only", "--from", "feat", pcbInTmp,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+      const a = run();
+      const b = run();
+      expect(a.status).toBe(0);
+      expect(b.status).toBe(0);
+      expect(a.stdout).toBe(b.stdout);
+      // The 330→470 bump from `feat` (still at init) to working tree must
+      // surface as an R1 value change.
+      expect(a.stdout).toMatch(/~\s*R1\s+value: 330 → 470/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--text-only pinning still works when the input file's directory no longer exists", () => {
+    // resolveInputs explicitly allows files that have been deleted from
+    // the working tree (still present at a ref). When the deletion took
+    // the file's parent directory with it, naively running `git -C
+    // <parent>` fails — but the repo itself is still reachable from
+    // farther up the tree. repoRootOf walks up to the first existing
+    // directory so ref pinning still finds the repo for this flow.
+    //
+    // Exercised via --text-only because the render path also tries to
+    // write a temp file beside the (now-missing) input dir, which is a
+    // separate concern; the ref-pinning fix is independent and lives in
+    // repoRootOf / pinParsedRefs.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-pin-deleted-"));
+    try {
+      // Commit a PCB inside a subdirectory, then `git rm` it (and remove
+      // the subdir entirely) so the working tree no longer contains
+      // either the file or its parent.
+      const sub = path.join(tmp, "boards");
+      fs.mkdirSync(sub);
+      fs.cpSync(PCB_FILE, path.join(sub, path.basename(PCB_FILE)));
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "add", "."], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: tmp });
+      execFileSync("git", ["rm", "-rq", "boards"], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "drop boards"], { cwd: tmp });
+      const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+      const beforeSha = execFileSync("git", ["rev-parse", "HEAD~1"], {
+        cwd: tmp, encoding: "utf8",
+      }).trim();
+
+      const deletedPcb = path.join(sub, path.basename(PCB_FILE));
+      const r = spawnSync(CLI, [
+        "--text-only", "--from", "HEAD~1", "--to", "HEAD", deletedPcb,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(0);
+      // The boards/ dir is gone but the repo isn't. Without the walk-up
+      // fix repoRootOf returned null → both sides of textdiff resolved
+      // to "no content" → the summary line read `+0 -0 ~0 =0`. With the
+      // fix we find the repo, read the before-side from HEAD~1, and the
+      // removed-component count is non-zero (every component in the PCB
+      // was deleted along with the file).
+      expect(r.stdout).toMatch(/-[1-9]\d* ~\d+ =\d+/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

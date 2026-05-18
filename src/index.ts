@@ -18,7 +18,7 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath } from "./render.ts";
+import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath, resolveRefToSha } from "./render.ts";
 import type { LogLevel, ProjectRenderResult } from "./render.ts";
 import { textDiff, markdownDiff, computeFileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
@@ -483,12 +483,12 @@ async function main(): Promise<void> {
   }
 
   try {
-    // --text-only short-circuits rendering entirely — useful when piping the
-    // structural diff into another tool without paying for SVG/PNG.
-    if (parsed.textOnly) { printTextDiff(parsed); return; }
-
     // --watch hands off to the long-running watcher: it does the same
     // initial render, then keeps re-rendering on every input file change.
+    // Deliberately runs *before* the main pinning step below — each
+    // rerender re-pins on its own (inside renderProject), so watch tracks
+    // a moving branch over the lifetime of the watcher instead of being
+    // frozen to whatever the ref pointed at when the watcher started.
     if (parsed.watch) {
       const { startWatch } = await import("./watch.ts");
       await startWatch({
@@ -504,6 +504,19 @@ async function main(): Promise<void> {
       });
       return;
     }
+
+    // Pin mutable refs once at the top of the run so every downstream
+    // consumer — renderProject, printTextDiff, buildMarkdownReport — sees
+    // the same commit. Without this, the branch could move between the
+    // render and the report and the markdown headings + structural diff
+    // would describe a different commit pair than the already-rendered
+    // images. Each callee still pins again internally; that resolution is
+    // idempotent once the ref is already a 40-char SHA.
+    pinParsedRefs(parsed);
+
+    // --text-only short-circuits rendering entirely — useful when piping the
+    // structural diff into another tool without paying for SVG/PNG.
+    if (parsed.textOnly) { printTextDiff(parsed); return; }
 
     // --markdown skips HTML viewer generation: the markdown is the deliverable
     // and the viewer would be redundant. Images still render so the markdown
@@ -556,9 +569,16 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
     console.error("Warning: text diff supports only .kicad_pcb / .kicad_sch — nothing to diff");
     return;
   }
-  const fromRef = parsed.fromRef ?? "HEAD";
-  const toRef = parsed.toRef ?? "";
   const repoRoot = repoRootOf(files[0]);
+  // Pin mutable refs to a commit SHA before any `git show`. textDiff reads
+  // each file twice (before + after), and across multiple files in a batch
+  // we'd issue many more reads — same race as the render path, same fix.
+  const fromRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
+    : (parsed.fromRef ?? "HEAD");
+  const toRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
+    : (parsed.toRef ?? "");
   const out = dest === "stderr"
     ? (s: string) => process.stderr.write(s + "\n")
     : (s: string) => console.log(s);
@@ -645,13 +665,22 @@ function buildMarkdownReport(
   project: ProjectRenderResult,
   mdDir: string,
 ): string {
-  const fromRef = parsed.fromRef ?? "HEAD";
-  const toRef = parsed.toRef ?? "";
-  const fromLabel = refLabelMd(fromRef);
-  const toLabel = refLabelMd(toRef);
   const repoRoot = project.results[0]
     ? repoRootOf(project.results[0].filePath)
     : null;
+  // Pin refs to commit SHAs so the structural diff (computed here via
+  // computeFileDiff → readAtRef) sees the same commit as the visual diff
+  // already rendered by renderProject. Without this the image and the
+  // component list could be computed against different commits if the
+  // branch moved between the render and the report.
+  const fromRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD")
+    : (parsed.fromRef ?? "HEAD");
+  const toRef = repoRoot
+    ? resolveRefToSha(repoRoot, parsed.toRef ?? "")
+    : (parsed.toRef ?? "");
+  const fromLabel = refLabelMd(fromRef);
+  const toLabel = refLabelMd(toRef);
 
   const fileTemplate = parsed.mdFileTemplate
     ? fs.readFileSync(parsed.mdFileTemplate, "utf8")
@@ -781,11 +810,43 @@ function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): v
 }
 
 function repoRootOf(filePath: string): string | null {
-  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], {
-    cwd: filePath.replace(/\/[^/]*$/, "") || ".",
+  // Walk up from the file's parent until we find an existing directory.
+  // `resolveInputs` allows files that no longer exist on disk (deleted on
+  // one side of the diff but still present at a ref) — in that case the
+  // immediate parent dir may not exist anymore even though the repo does,
+  // and a `git -C <missing>` would fail. Mirrors getRepoRoot() in
+  // src/render.ts so the deleted-file flow doesn't silently skip ref
+  // pinning.
+  let dir = path.dirname(filePath);
+  while (!fs.existsSync(dir)) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const r = spawnSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   });
   return r.status === 0 ? r.stdout.trim() : null;
+}
+
+/** Pin `parsed.fromRef` / `parsed.toRef` to concrete commit SHAs once for
+ *  the whole CLI invocation. Mutating the parsed object propagates the
+ *  pinned values to every downstream consumer (renderProject,
+ *  printTextDiff, buildMarkdownReport) without each having to thread an
+ *  extra parameter. No-op when there are no resolvable inputs, or when
+ *  the input doesn't sit inside a git repo. */
+function pinParsedRefs(parsed: ParsedArgs): void {
+  let files: string[];
+  try {
+    files = resolveInputs(parsed.input, parsed.scope);
+  } catch {
+    return; // resolveInputs throws on bad input; let the dispatcher report it
+  }
+  if (files.length === 0) return;
+  const repoRoot = repoRootOf(files[0]);
+  if (!repoRoot) return;
+  parsed.fromRef = resolveRefToSha(repoRoot, parsed.fromRef ?? "HEAD");
+  parsed.toRef = resolveRefToSha(repoRoot, parsed.toRef ?? "");
 }
 
 main();
