@@ -106,6 +106,8 @@ Options:
   -q, --quiet            Suppress the summary entirely
   --log <level>          Set summary log level: quiet | info | debug (default: info)
   --no-cache             Skip the render cache (default: cached at \$XDG_CACHE_HOME/kicadiff)
+  --exit-code            Exit with status 1 if any change is detected, 0 otherwise.
+                         Errors still exit non-zero. Mirrors \`git diff --exit-code\`.
   --watch                Long-running mode: re-render whenever an input KiCad
                          file changes. Hot reload comes from your viewer —
                          open the diff HTML in VSCode Live Preview, live-server,
@@ -173,6 +175,11 @@ interface ParsedArgs {
    *  viewer is delegated to whatever already serves the HTML (VSCode Live
    *  Preview, live-server, browsersync, etc.). */
   watch?: boolean;
+  /** `git diff --exit-code` semantics: when set, exit 1 if any change is
+   *  detected, 0 otherwise. Errors still exit non-zero as today. Lets CI
+   *  wrappers detect "kicad files changed" via process exit instead of
+   *  parsing stdout. */
+  exitCode?: boolean;
 }
 
 /** Known names that can be used after a bare `--open` (with a space).
@@ -279,6 +286,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let open: string | undefined;
   let watch = false;
   let cached = false;
+  let exitCode = false;
 
   for (; i < argv.length; i++) {
     const arg = argv[i];
@@ -321,6 +329,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       noCache = true;
     } else if (arg === "--watch") {
       watch = true;
+    } else if (arg === "--exit-code") {
+      exitCode = true;
     } else if (arg === "--cached" || arg === "--staged") {
       // `git diff --cached` semantics: compare HEAD against the index.
       // Explicit --from / --to / positional refs still win.
@@ -453,6 +463,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   return {
     input, fromRef, toRef, outputDir, outputHtml, imagesOnly, text, textOnly,
     markdown, mdTemplate, mdFileTemplate, logLevel, noCache, scope, open, watch,
+    exitCode,
   };
 }
 
@@ -568,7 +579,11 @@ async function main(): Promise<void> {
 
     // --text-only short-circuits rendering entirely — useful when piping the
     // structural diff into another tool without paying for SVG/PNG.
-    if (parsed.textOnly) { printTextDiff(parsed); return; }
+    if (parsed.textOnly) {
+      const anyChanges = printTextDiff(parsed);
+      if (parsed.exitCode && anyChanges) process.exit(1);
+      return;
+    }
 
     // --markdown skips HTML viewer generation: the markdown is the deliverable
     // and the viewer would be redundant. Images still render so the markdown
@@ -604,22 +619,55 @@ async function main(): Promise<void> {
       if (!quiet && !stdoutIsReport) newline("");
       emitMarkdownReport(parsed, project);
     }
+    if (parsed.exitCode && projectHasChanges(parsed, project)) {
+      process.exit(1);
+    }
   } catch (e) {
     console.error(`Error: ${(e as Error).message}`);
     process.exit(1);
   }
 }
 
+/** True if any file in the rendered project shows a meaningful change.
+ *  Mirrors the per-file `has_changes` definition exposed to markdown
+ *  templates in buildMarkdownReport: structural diff, visual diff (PNG
+ *  bytes differ), or one side missing entirely. Kept in sync with that
+ *  definition so `--exit-code` and the markdown `{{has_changes}}` flag
+ *  always agree about what counts as a change. */
+function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): boolean {
+  const repoRoot = project.results[0] ? repoRootOf(project.results[0].filePath) : null;
+  // parsed.{from,to}Ref are already pinned at the top of main(); fall back
+  // to the same defaults the rest of the pipeline uses if pinning was a no-op.
+  const fromRef = parsed.fromRef ?? INDEX_REF;
+  const toRef = parsed.toRef ?? "";
+  for (const r of project.results) {
+    const m = r.manifest;
+    const hasBoth = !!(m.hasBefore && r.beforePng && r.afterPng);
+    const afterOnly = !hasBoth && !!r.afterPng;
+    const beforeOnly = !hasBoth && !r.afterPng && !!r.beforePng;
+    if (afterOnly || beforeOnly) return true;
+    if (m.hasDiff) return true;
+    if (m.type === "pcb" || m.type === "sch") {
+      const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
+      if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Resolve inputs and emit a structural text diff for each file. By default
  *  goes to stdout; pass "stderr" to redirect (used when stdout is reserved
  *  for a markdown report being piped into a file). Skips file types that
- *  the text differ doesn't support (sym/fp). */
-function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout"): void {
+ *  the text differ doesn't support (sym/fp). Returns true if any file has
+ *  a non-zero structural delta — used by --exit-code. */
+function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout"): boolean {
   const files = resolveInputs(parsed.input, parsed.scope)
     .filter(f => f.endsWith(".kicad_pcb") || f.endsWith(".kicad_sch"));
   if (files.length === 0) {
     console.error("Warning: text diff supports only .kicad_pcb / .kicad_sch — nothing to diff");
-    return;
+    return false;
   }
   const repoRoot = repoRootOf(files[0]);
   // Pin mutable refs to a commit SHA before any `git show`. textDiff reads
@@ -634,9 +682,17 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
   const out = dest === "stderr"
     ? (s: string) => process.stderr.write(s + "\n")
     : (s: string) => console.log(s);
+  let anyChanges = false;
   for (const f of files) {
     out(textDiff(f, fromRef, toRef, repoRoot));
+    // Recompute via computeFileDiff so we observe the same counts the text
+    // output prints. Cheap: parses the same two strings already read above.
+    const fd = computeFileDiff(f, fromRef, toRef, repoRoot);
+    if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+      anyChanges = true;
+    }
   }
+  return anyChanges;
 }
 
 /** Format a friendly ref label for markdown headings. Mirrors the viewer's
