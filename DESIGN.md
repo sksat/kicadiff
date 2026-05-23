@@ -124,10 +124,30 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
   ~ R1  value: 330 → 470
   ~ C5  value: 100nF → 220nF
   ~ U1  pos: 100.00,50.00 → 105.00,50.00
+  Nets: +1 -0 ~1
+    + /LED_OUT
+    ~ R1.2: GND → /LED_OUT
 ```
 
 `+` 追加、`-` 削除、`~` 変更、`=` 変更なし。markdown 版はこれを
 `### Added` / `### Removed` / `### Changed` のリストとして整形する。
+
+`.kicad_pcb` のみ、トップレベル `(net N "name")` 表と各 pad の
+`(net ...)` membership を読み、`Nets` サブセクション (markdown 版は
+`### Nets`) として「追加 / 削除されたネット」と「pad の接続先が
+変わったケース (`R1.2: GND → /LED_OUT`)」を出力する。Net の identity は
+**名前** で持つ — id は保存ごとに振り直されるため安定しない。`""`
+(unconnected) は除外 (unrouted pad の churn で diff が埋まるのを
+防ぐ)。footprint 自体が added / removed のときは、その footprint の
+pad 変更行は `Nets` サブセクションから抑制する (footprint レベルの
+行で代替済)。トップ行の `+A -R ~C =U` summary は component 専用の
+ままにしてあるので、既存の summary を grep / parse している hook 等
+は互換のまま動く。
+
+回路図側 (`.kicad_sch`) の net 差分は実装していない。回路図では
+電気的接続が wire / label / hierarchical pin / bus membership に
+分散するため、純粋なテキスト diff には収まらないトレースが必要。
+TODO として残す。
 
 ### DRC / ERC 違反差分 (`kicadiff check`)
 

@@ -6,9 +6,10 @@
  * The output is a compact, human-readable summary suitable for terminals,
  * commit messages, or CI logs — complementary to the visual HTML diff.
  *
- * Intentionally does NOT try to be a complete schematic differ — wires,
- * net classes, board outlines, etc. are out of scope. The goal is "what
- * components changed?", which covers the vast majority of real edits.
+ * For .kicad_pcb we additionally diff electrical connectivity at two
+ * levels — see the "Net extraction" section below. Schematic net
+ * tracing (wires + labels + bus membership) is harder and remains out
+ * of scope; net classes and board outlines also remain out of scope.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -203,6 +204,102 @@ export function extractComponents(src: string, fileType: FileType): Component[] 
 }
 
 // =============================================================================
+// Net extraction (PCB only)
+// =============================================================================
+
+/**
+ * Connectivity snapshot of a PCB. Two pieces, both keyed by *name* (not id,
+ * because KiCad freely renumbers net ids between saves — the name is the
+ * stable identity for a net).
+ *
+ *   - `names`     : the set of named nets that exist in the file. The
+ *                   unconnected net (`""`) is deliberately excluded; it
+ *                   churns constantly as the router shuffles unrouted pads
+ *                   and would drown the real diff in noise.
+ *   - `padNets`   : map of `"<ref>.<padNum>"` → net name, again excluding
+ *                   pads whose net is `""`. Identity is the pad identifier
+ *                   so we can detect "this physical pad was rewired".
+ *   - `componentRefs` : set of footprint refs present, used so the diff
+ *                   layer can suppress pad-moved lines for pads whose
+ *                   parent footprint was itself added or removed (avoids
+ *                   emitting `R5.1 ""→GND` for every pad of a freshly
+ *                   added R5; the footprint-level `+ R5` line covers it).
+ */
+export interface NetInfo {
+  names: Set<string>;
+  padNets: Map<string, string>;
+  componentRefs: Set<string>;
+}
+
+export function extractNets(src: string): NetInfo {
+  const tree = parseSexp(src);
+  const names = new Set<string>();
+  const padNets = new Map<string, string>();
+  const componentRefs = new Set<string>();
+
+  // Top-level (net N "name") entries enumerate the project's net table.
+  // We only look at the outermost list (kicad_pcb) — nested (net ...) inside
+  // pads is membership, not declaration, and is picked up below.
+  if (tree.length > 0 && Array.isArray(tree[0])) {
+    for (const child of tree[0]) {
+      if (Array.isArray(child) && child[0] === "net" && typeof child[2] === "string") {
+        if (child[2] !== "") names.add(child[2]);
+      }
+    }
+  }
+
+  walk(tree, "footprint", node => {
+    const ref = findProperty(node, "Reference") ?? "";
+    if (!ref) return;
+    componentRefs.add(ref);
+    for (const child of node) {
+      if (!Array.isArray(child) || child[0] !== "pad") continue;
+      const padNum = typeof child[1] === "string" ? child[1] : "";
+      if (!padNum) continue;
+      // Pad's (net id "name") sub-form. Absent for NC pads.
+      const netSub = child.find(c => Array.isArray(c) && c[0] === "net");
+      if (Array.isArray(netSub) && typeof netSub[2] === "string" && netSub[2] !== "") {
+        padNets.set(`${ref}.${padNum}`, netSub[2]);
+      }
+    }
+  });
+
+  return { names, padNets, componentRefs };
+}
+
+export interface NetDiff {
+  added: string[];
+  removed: string[];
+  /** Pads whose net assignment changed. `before` / `after` are net names;
+   *  if a pad gained or lost a net entirely, the missing side is `""`. */
+  padChanges: { pad: string; before: string; after: string }[];
+}
+
+export function diffNets(before: NetInfo, after: NetInfo): NetDiff {
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const n of after.names) if (!before.names.has(n)) added.push(n);
+  for (const n of before.names) if (!after.names.has(n)) removed.push(n);
+  added.sort();
+  removed.sort();
+
+  const padChanges: NetDiff["padChanges"] = [];
+  const padKeys = new Set<string>([...before.padNets.keys(), ...after.padNets.keys()]);
+  for (const key of padKeys) {
+    const b = before.padNets.get(key) ?? "";
+    const a = after.padNets.get(key) ?? "";
+    if (b === a) continue;
+    // Skip moves to/from the unconnected net — same rationale as excluding
+    // "" from `names`. A real rewire (named-net → named-net) survives.
+    if (b === "" || a === "") continue;
+    padChanges.push({ pad: key, before: b, after: a });
+  }
+  padChanges.sort((x, y) => x.pad.localeCompare(y.pad, undefined, { numeric: true }));
+
+  return { added, removed, padChanges };
+}
+
+// =============================================================================
 // Diff
 // =============================================================================
 
@@ -271,6 +368,9 @@ export interface FileDiff {
   fileType: FileType;
   rel: string;
   diff: ComponentDiff;
+  /** Net-level diff. Populated for `pcb` only; undefined for `sch` (schematic
+   *  net tracing is out of scope — TODO when wire-tracing lands). */
+  nets?: NetDiff;
 }
 
 /** Compute a structural component diff for a single KiCad file. The result is
@@ -293,7 +393,26 @@ export function computeFileDiff(
   const after = afterSrc ? extractComponents(afterSrc, fileType) : [];
 
   const rel = repoRoot ? path.relative(repoRoot, filePath) : filePath;
-  return { fileType, rel, diff: diffComponents(before, after) };
+  const result: FileDiff = { fileType, rel, diff: diffComponents(before, after) };
+
+  if (fileType === "pcb") {
+    const empty = { names: new Set<string>(), padNets: new Map<string, string>(), componentRefs: new Set<string>() };
+    const beforeNets = beforeSrc ? extractNets(beforeSrc) : empty;
+    const afterNets = afterSrc ? extractNets(afterSrc) : empty;
+    const netDiff = diffNets(beforeNets, afterNets);
+    // Drop pad-change lines whose footprint was itself added or removed —
+    // the footprint-level `+ R5` / `- R5` line already conveys the change,
+    // and listing every pad of a freshly added part is noise.
+    const addedRefs = new Set(result.diff.added.map(c => c.ref));
+    const removedRefs = new Set(result.diff.removed.map(c => c.ref));
+    netDiff.padChanges = netDiff.padChanges.filter(p => {
+      const ref = p.pad.split(".")[0];
+      return !addedRefs.has(ref) && !removedRefs.has(ref);
+    });
+    result.nets = netDiff;
+  }
+
+  return result;
 }
 
 /** Render a textual diff for a single KiCad file. Returns a multi-line string. */
@@ -303,7 +422,8 @@ export function textDiff(
   toRef: string,
   repoRoot: string | null,
 ): string {
-  const { fileType, rel, diff: d } = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const fd = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const { fileType, rel, diff: d, nets } = fd;
   const lines: string[] = [];
   lines.push(`${rel} (${fileType}): +${d.added.length} -${d.removed.length} ~${d.changed.length} =${d.unchanged}`);
 
@@ -324,6 +444,20 @@ export function textDiff(
     }
     lines.push(`  ~ ${displayRef(ch.after)}  ${parts.join(", ")}`);
   }
+
+  // Net subsection. Format:
+  //   Nets: +A -R ~P
+  //     + new_net_name
+  //     - old_net_name
+  //     ~ R1.2: old_net → new_net
+  // The header summary stays component-only so existing callers / templates
+  // that parse `+A -R ~C =U` keep working unchanged.
+  if (nets && (nets.added.length || nets.removed.length || nets.padChanges.length)) {
+    lines.push(`  Nets: +${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length}`);
+    for (const n of nets.added) lines.push(`    + ${n}`);
+    for (const n of nets.removed) lines.push(`    - ${n}`);
+    for (const p of nets.padChanges) lines.push(`    ~ ${p.pad}: ${p.before} → ${p.after}`);
+  }
   return lines.join("\n");
 }
 
@@ -336,7 +470,8 @@ export function markdownDiff(
   toRef: string,
   repoRoot: string | null,
 ): string {
-  const { fileType, rel, diff: d } = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const fd = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const { fileType, rel, diff: d, nets } = fd;
   const lines: string[] = [];
 
   // File header. Backtick the path so it renders monospace and won't be
@@ -375,6 +510,16 @@ export function markdownDiff(
         parts.push(`${f}: \`${bv}\` → \`${av}\``);
       }
       lines.push(`- \`${displayRef(ch.after)}\` — ${parts.join(", ")}`);
+    }
+  }
+
+  if (nets && (nets.added.length || nets.removed.length || nets.padChanges.length)) {
+    lines.push("");
+    lines.push(`### Nets (+${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length})`);
+    for (const n of nets.added) lines.push(`- \`+\` \`${n}\``);
+    for (const n of nets.removed) lines.push(`- \`-\` \`${n}\``);
+    for (const p of nets.padChanges) {
+      lines.push(`- \`~\` \`${p.pad}\` — \`${p.before}\` → \`${p.after}\``);
     }
   }
   return lines.join("\n");
