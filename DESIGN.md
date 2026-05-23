@@ -530,3 +530,25 @@ cache hit 時は `combined.png` を `<sideDir>/<safe>.png` に、`extras/`
 
 cache miss 時はレンダリング → 結果をキャッシュへ書き戻す (best-effort、
 失敗しても render 自体は成功扱い)。
+
+### キャッシュの GC
+
+キャッシュは content-addressed なので自動的には evict しない (古い entry
+を残しても誤った render を返すことは無く、単に容量を食うだけ)。代わりに
+明示的な管理コマンドを提供する:
+
+- `kicadiff cache stats` — エントリ数、合計サイズ、最古 / 最新エントリの
+  mtime を表示
+- `kicadiff cache prune --older-than <D>` — mtime が D より古い leaf
+  ディレクトリを削除 (D は `30d` / `12h` / `45m` のように単位必須。
+  単位なしのリテラル数値は誤動作防止のために拒否する)
+- `kicadiff cache prune --all --yes` — 全削除。非 TTY 環境では `--yes`
+  必須 (CI が prompt で hang しないため)
+- `--dry-run` — どちらの prune モードでも、削除せず削除予定だけ表示
+
+実装は `src/cache.ts` に分離してある。レンダリングと違って外部ツールに
+依存せず、`getCacheDir()` だけ render.ts と同じロジックを duplicate
+している (依存方向を CLI → cache → render の順に固定するため)。
+leaf を削除した後、空になった bucket dir (`<hash[0:2]>/`) も rmdir
+する。`--all` 後はキャッシュ root 自体も rmdir し、`cache stats` が
+clean な `(empty)` メッセージを返す状態にする。

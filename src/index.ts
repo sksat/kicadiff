@@ -30,6 +30,7 @@ import type { LogLevel, ProjectRenderResult } from "./render.ts";
 import { textDiff, markdownDiff, computeFileDiff, type FileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
 import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
+import { runCache } from "./cache.ts";
 import type { FileType } from "./types.ts";
 
 function usage(): void {
@@ -58,6 +59,10 @@ Subcommands:
              kicad-cli, git errors, JSON parse errors) also produce a
              non-zero exit. Same positional shape as bare \`kicadiff\` (refs
              first, input last). Skips .kicad_sym / .kicad_mod.
+  cache      Manage the render cache. \`cache stats\` prints disk usage and
+             entry counts; \`cache prune --older-than <D>\` or
+             \`cache prune --all --yes\` reclaim space. See
+             \`kicadiff cache --help\` for the full surface.
 
 Inputs (positional):
   <input>    One of:
@@ -546,6 +551,14 @@ async function main(): Promise<void> {
   if (argv[0] === "-h" || argv[0] === "--help") {
     usage();
     process.exit(0);
+  }
+
+  if (argv[0] === "cache") {
+    // Cache management is its own thing: it doesn't render, doesn't touch
+    // the working tree, and has its own help text. Dispatch and exit
+    // before the regular argument parser runs (which would reject
+    // --older-than / --all as unknown options).
+    process.exit(runCache(argv.slice(1)));
   }
 
   if (argv[0] === "hook") {

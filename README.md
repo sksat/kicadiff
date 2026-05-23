@@ -185,6 +185,23 @@ Every per-side render is content-addressed and cached under
 against unchanged content return in ~1 s vs ~5 s cold. Bypass with
 `--no-cache` or override the location with `KICADIFF_CACHE_DIR`.
 
+The cache grows monotonically — every kicad-cli version bump and every
+content edit adds a new entry, and nothing is evicted automatically.
+Inspect and reclaim space with the `cache` subcommand:
+
+```sh
+# Show cache directory, entry count, total size, and oldest / newest age
+kicadiff cache stats
+
+# Delete entries older than a cutoff (units: s/m/h/d, unit required)
+kicadiff cache prune --older-than 30d
+kicadiff cache prune --older-than 30d --dry-run    # preview, change nothing
+
+# Wipe the whole cache. `--yes` is required in non-TTY (CI) environments
+# so the prompt can never hang a build.
+kicadiff cache prune --all --yes
+```
+
 ## GitHub Actions
 
 Drop the action into a workflow to render a visual diff for every PR
