@@ -29,6 +29,7 @@ import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath, r
 import type { LogLevel, ProjectRenderResult } from "./render.ts";
 import { textDiff, markdownDiff, computeFileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
+import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
 import type { FileType } from "./types.ts";
 
 function usage(): void {
@@ -49,6 +50,12 @@ Subcommands:
   hook       Claude Code PostToolUse adapter: read the hook JSON from stdin,
              render only when the edited file is .kicad_pcb / .kicad_sch.
              Defaults to \`--open vscode\`; pass \`--open ...\` to override.
+  check      Run DRC (.kicad_pcb) / ERC (.kicad_sch) on both sides and report
+             the violation delta as +N new / -M fixed / =K unchanged. Exits 1
+             iff there are NEW violations on the target side, so the gate
+             fails only on regressions — pre-existing violations that persist
+             do not fail the check. Same positional shape as bare \`kicadiff\`
+             (refs first, input last). Skips .kicad_sym / .kicad_mod.
 
 Inputs (positional):
   <input>    One of:
@@ -548,6 +555,21 @@ async function main(): Promise<void> {
     argv = expanded;
   }
 
+  // `check` is a verb subcommand: it reuses the rest of kicadiff's positional
+  // parser (refs + input), but the dispatch target is the DRC/ERC differ
+  // rather than the render pipeline. Strip the leading `check` token here so
+  // the remaining argv shape matches everywhere else, then hand off to
+  // runCheckCli below.
+  let checkMode = false;
+  if (argv[0] === "check") {
+    if (argv[1] === "-h" || argv[1] === "--help") {
+      usage();
+      process.exit(0);
+    }
+    checkMode = true;
+    argv = argv.slice(1);
+  }
+
   let parsed: ParsedArgs;
   try {
     parsed = parseArgs(argv);
@@ -555,6 +577,17 @@ async function main(): Promise<void> {
     console.error(`Error: ${(e as Error).message}`);
     usage();
     process.exit(1);
+  }
+
+  if (checkMode) {
+    try {
+      pinParsedRefs(parsed);
+      const exit = runCheckCli(parsed);
+      process.exit(exit);
+    } catch (e) {
+      console.error(`Error: ${(e as Error).message}`);
+      process.exit(1);
+    }
   }
 
   try {
@@ -679,6 +712,35 @@ function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): bo
     }
   }
   return false;
+}
+
+/** Resolve inputs, run DRC/ERC on each supported file at both refs, and
+ *  print the violation delta. Returns the process exit code: 1 if any file
+ *  introduced NEW violations on the `to` side (i.e. a regression), 0
+ *  otherwise. Files that don't support DRC/ERC (.kicad_sym, .kicad_mod) are
+ *  skipped with a stderr note rather than failing the run — a `check` over
+ *  a project directory may legitimately include sibling libraries. */
+function runCheckCli(parsed: ParsedArgs): number {
+  const files = resolveInputs(parsed.input, parsed.scope);
+  const supported = files.filter((f) => checkKindFor(f) !== null);
+  const skipped = files.filter((f) => checkKindFor(f) === null);
+  for (const f of skipped) {
+    console.error(`kicadiff check: skipping unsupported file type: ${f}`);
+  }
+  if (supported.length === 0) {
+    console.error("kicadiff check: no .kicad_pcb / .kicad_sch inputs to check");
+    return 0;
+  }
+  const repoRoot = repoRootOf(supported[0]);
+  const fromRef = parsed.fromRef ?? INDEX_REF;
+  const toRef = parsed.toRef ?? "";
+  const results = runCheck({ files: supported, fromRef, toRef, repoRoot });
+  let anyNew = false;
+  for (const r of results) {
+    console.log(formatCheckDiff(r.displayPath, r.kind, r.diff));
+    if (r.diff.added.length > 0) anyNew = true;
+  }
+  return anyNew ? 1 : 0;
 }
 
 /** Resolve inputs and emit a structural text diff for each file. By default

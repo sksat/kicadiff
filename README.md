@@ -19,6 +19,11 @@ file in your browser, or as a markdown report you can paste into a PR.
   designator). Good for PR descriptions and commit messages.
 - **Text-only structural diff** (`--text-only`) — fast, no image
   rendering, prints to stdout.
+- **DRC / ERC violation diff** (`kicadiff check`) — runs design-rule and
+  electrical-rule checks on both sides and reports the delta as
+  `+N new / -M fixed / =K unchanged`. Exits non-zero only on NEW
+  violations, so it makes a good PR gate that fails on regressions
+  while ignoring pre-existing findings.
 
 ## Requirements
 
@@ -129,6 +134,16 @@ kicadiff project/ --exit-code           # exit 1 if any change (mirrors `git dif
 # stdin, renders only when the edited file is .kicad_pcb / .kicad_sch.
 # Default: --open vscode (override with --open <target> as usual).
 kicadiff hook
+
+# DRC / ERC violation diff — third fast-path mode alongside --text-only.
+# Runs `kicad-cli pcb drc` (PCB) / `kicad-cli sch erc` (schematic) on both
+# sides and reports the delta as +N new / -M fixed / =K unchanged. Exits 1
+# iff there are NEW violations on the target side; pre-existing violations
+# that persist do not fail the gate. Useful as a PR gate that fails only on
+# regressions, independent of any visual diff.
+kicadiff check                          # PCB+sch in cwd, index vs working
+kicadiff check HEAD project/            # working tree vs HEAD
+kicadiff check main..feat foo.kicad_pcb # main vs feat, PCB only
 ```
 
 ## Output

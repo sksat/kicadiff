@@ -129,6 +129,45 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
 `+` 追加、`-` 削除、`~` 変更、`=` 変更なし。markdown 版はこれを
 `### Added` / `### Removed` / `### Changed` のリストとして整形する。
 
+### DRC / ERC 違反差分 (`kicadiff check`)
+
+`--text-only` と並ぶ 3 番目の fast-path mode。レンダリングを完全に
+スキップし、`kicad-cli pcb drc` / `kicad-cli sch erc` を before/after
+両側で実行して **違反の差分** を出す:
+
+```
+foo.kicad_pcb (drc): +2 -1 =5
+  + clearance              Pad 1 of R1 / Pad 1 of R2
+  + courtyards_overlap     footprint R5 / R6
+  - lengths_match          (resolved)
+bar.kicad_sch (erc): +0 -0 =3
+```
+
+実装は `src/check.ts`。違反の「同一性」は
+`signatureOf(v) = sha256(type ‖ sorted item descriptions)` で判定する:
+
+- `type` は KiCad の enum key (`clearance`, `unconnected_items` …) なので
+  description の文言ゆれに強い。
+- item description は具体的に関与しているパッド / トラックを示すので、
+  別の clearance 違反と取り違えない。
+- 意図的に除外しているもの: `uuid` (再生成されうる)、`pos` (0.01mm の
+  ナッジで新規違反扱いになるのを防ぐ)、`severity` (config 変更で
+  warning → error 昇格しただけのケースで `+1 -1` にしない)。
+
+git ref からの実行も対応。`render.ts` の temp lifecycle パターンを
+踏襲しつつ、`check` は per-side のキャッシュ整合性を気にしないので、
+ファイルとその sibling `.kicad_pro` / `.kicad_prl` を専用の tmpdir
+(`mktemp -d`) に展開する方式を採る。DRC は project file 内の design
+rule (clearance, track width, …) に依存するので siblings の抽出は
+必須。working tree の汚染を避けるための finally unlink ダンスは
+tmpdir 一括削除に集約できる。
+
+終了コードは「**新規違反があれば 1**」。pre-existing な違反が残って
+いるだけでは fail しない — PR gate の意図は「この変更が違反を持ち
+込んだか」であって「全違反ゼロか」ではないため。CI で全違反ゼロを
+要求したい場合は `kicad-cli pcb drc --exit-code-violations` を直接
+使えばよい。
+
 ## CLI 引数の解析
 
 `git diff` 互換のために単純な flag-only パーサーは使わず、自前で

@@ -1,0 +1,287 @@
+import { test, expect } from "@playwright/test";
+import { execFileSync, spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  diffViolations,
+  signatureOf,
+  formatCheckDiff,
+  type Violation,
+} from "../src/check.ts";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const PROJECT_DIR = path.resolve(__dirname, "..");
+const CLI = path.join(PROJECT_DIR, "kicadiff");
+const BLINK_FIXTURE_DIR = path.join(PROJECT_DIR, "examples/blink");
+const BLINK_PCB = path.join(BLINK_FIXTURE_DIR, "blink.kicad_pcb");
+const BLINK_SCH = path.join(BLINK_FIXTURE_DIR, "blink.kicad_sch");
+
+// =============================================================================
+// Unit tests for the violation differ.
+// These test the format-agnostic core, with hand-rolled Violation arrays.
+// =============================================================================
+
+function v(
+  type: string,
+  description: string,
+  items: { description: string; uuid?: string; pos?: { x: number; y: number } }[],
+  severity: "error" | "warning" | "exclusion" = "error",
+): Violation {
+  return { type, severity, description, items };
+}
+
+test.describe("signatureOf", () => {
+  test("two violations with the same type and item descriptions match", () => {
+    const a = v("clearance", "Clearance violation", [
+      { description: "Pad 1 of R1" },
+      { description: "Pad 1 of R2" },
+    ]);
+    const b = v("clearance", "Clearance violation", [
+      { description: "Pad 1 of R1" },
+      { description: "Pad 1 of R2" },
+    ]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+  });
+
+  test("identity is independent of item order (so KiCad's traversal order doesn't break matching)", () => {
+    const a = v("clearance", "Clearance violation", [
+      { description: "Pad 1 of R1" },
+      { description: "Pad 1 of R2" },
+    ]);
+    const b = v("clearance", "Clearance violation", [
+      { description: "Pad 1 of R2" },
+      { description: "Pad 1 of R1" },
+    ]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+  });
+
+  test("different type produces a different signature", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1" }]);
+    const b = v("courtyards_overlap", "x", [{ description: "Pad 1 of R1" }]);
+    expect(signatureOf(a)).not.toBe(signatureOf(b));
+  });
+
+  test("different referenced items produce a different signature", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1" }]);
+    const b = v("clearance", "x", [{ description: "Pad 1 of R5" }]);
+    expect(signatureOf(a)).not.toBe(signatureOf(b));
+  });
+
+  test("uuid changes alone do NOT break matching (uuids may be regenerated)", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1", uuid: "aaa" }]);
+    const b = v("clearance", "x", [{ description: "Pad 1 of R1", uuid: "bbb" }]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+  });
+
+  test("position changes do NOT break matching (small moves should track)", () => {
+    const a = v("clearance", "x",
+      [{ description: "Pad 1 of R1", pos: { x: 100, y: 50 } }]);
+    const b = v("clearance", "x",
+      [{ description: "Pad 1 of R1", pos: { x: 101, y: 51 } }]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+  });
+});
+
+test.describe("diffViolations", () => {
+  test("empty before + empty after → empty diff", () => {
+    const d = diffViolations([], []);
+    expect(d.added).toEqual([]);
+    expect(d.removed).toEqual([]);
+    expect(d.unchanged).toEqual([]);
+  });
+
+  test("identical before & after → all unchanged", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1" }]);
+    const d = diffViolations([a], [a]);
+    expect(d.added).toEqual([]);
+    expect(d.removed).toEqual([]);
+    expect(d.unchanged.length).toBe(1);
+  });
+
+  test("new violation appears in `added`", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1" }]);
+    const b = v("courtyards_overlap", "x", [{ description: "Pad 1 of R2" }]);
+    const d = diffViolations([a], [a, b]);
+    expect(d.added.length).toBe(1);
+    expect(d.added[0].type).toBe("courtyards_overlap");
+    expect(d.removed).toEqual([]);
+    expect(d.unchanged.length).toBe(1);
+  });
+
+  test("fixed violation appears in `removed`", () => {
+    const a = v("clearance", "x", [{ description: "Pad 1 of R1" }]);
+    const b = v("courtyards_overlap", "x", [{ description: "Pad 1 of R2" }]);
+    const d = diffViolations([a, b], [a]);
+    expect(d.removed.length).toBe(1);
+    expect(d.removed[0].type).toBe("courtyards_overlap");
+    expect(d.added).toEqual([]);
+    expect(d.unchanged.length).toBe(1);
+  });
+
+  test("duplicate violations on each side are counted separately", () => {
+    // KiCad sometimes reports the same logical violation twice (e.g. two
+    // unconnected-items entries for the same net). We treat each entry as
+    // distinct so the +/- numbers aren't silently collapsed.
+    const a = v("unconnected_items", "x", [{ description: "Pad 1 of R1" }]);
+    const d = diffViolations([a], [a, a]);
+    expect(d.added.length).toBe(1);
+    expect(d.unchanged.length).toBe(1);
+  });
+});
+
+test.describe("formatCheckDiff", () => {
+  test("reports +N -M =K summary line", () => {
+    const same = v("clearance", "Clearance violation", [{ description: "Pad 1 of R1" }]);
+    const added = v("courtyards_overlap", "Overlap", [{ description: "footprint R5 / R6" }]);
+    const removed = v("lengths_match", "Length mismatch", [{ description: "diff pair" }]);
+    const diff = diffViolations([same, removed], [same, added]);
+    const out = formatCheckDiff("foo.kicad_pcb", "drc", diff);
+    const head = out.split("\n")[0];
+    expect(head).toContain("foo.kicad_pcb");
+    expect(head).toContain("(drc)");
+    expect(head).toContain("+1");
+    expect(head).toContain("-1");
+    expect(head).toContain("=1");
+  });
+
+  test("lists added violations with `+` prefix", () => {
+    const added = v("courtyards_overlap", "Overlap", [{ description: "footprint R5" }]);
+    const out = formatCheckDiff("foo.kicad_pcb", "drc", diffViolations([], [added]));
+    expect(out).toMatch(/^\s*\+\s+courtyards_overlap/m);
+  });
+
+  test("lists removed violations with `-` prefix", () => {
+    const removed = v("clearance", "Clearance", [{ description: "Pad 1 of R1" }]);
+    const out = formatCheckDiff("foo.kicad_pcb", "drc", diffViolations([removed], []));
+    expect(out).toMatch(/^\s*-\s+clearance/m);
+  });
+});
+
+// =============================================================================
+// Integration tests for the `kicadiff check` subcommand.
+//
+// `examples/blink/blink.kicad_pcb` is DRC-clean (no violations).
+// `examples/blink/blink.kicad_sch` has 5 ERC violations (pre-existing).
+// We exercise both directions: a no-op compare and a compare that introduces
+// changes.
+// =============================================================================
+
+function initRepoWithBlink(dir: string): string {
+  fs.cpSync(BLINK_FIXTURE_DIR, dir, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+  execFileSync("git", [
+    "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+    "add", ".",
+  ], { cwd: dir });
+  execFileSync("git", [
+    "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "-q", "-m", "init",
+  ], { cwd: dir });
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: dir, encoding: "utf8",
+  }).trim();
+}
+
+test.beforeAll(() => {
+  if (!fs.existsSync(BLINK_PCB)) test.skip(true, `KiCad fixture missing: ${BLINK_PCB}`);
+});
+
+test.describe("kicadiff check (integration)", () => {
+  test("HEAD vs HEAD on a DRC-clean PCB: exits 0, reports +0 -0", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-clean-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(BLINK_PCB));
+      const r = spawnSync(CLI, ["check", "HEAD", "HEAD", pcbInTmp], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("(drc)");
+      expect(r.stdout).toMatch(/\+0\b/);
+      expect(r.stdout).toMatch(/-0\b/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("introducing an ERC violation: exits 1, reports +N new", () => {
+    // The blink schematic already has 5 ERC violations (pin_not_connected on
+    // ERC markers). Removing a wire segment from a net is a heavy-handed but
+    // deterministic way to add a new dangling-pin / no-connect-style violation
+    // on top of the existing baseline; here we take the simpler approach of
+    // deleting an unrelated junction by stripping a `(no_connect ...)` from
+    // the schematic — every NC marker that disappears flips a previously-
+    // suppressed pin back into a "Pin not connected" error.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-erc-"));
+    try {
+      initRepoWithBlink(tmp);
+      const schInTmp = path.join(tmp, path.basename(BLINK_SCH));
+      const src = fs.readFileSync(schInTmp, "utf8");
+      // Strip one wire from the schematic — removing a wire that connected
+      // two pins introduces dangling-wire / pin-not-connected ERC errors
+      // that weren't present at HEAD. We scan for `(wire ` then walk the
+      // parens to find the matching `)`, because the wire block contains
+      // nested groups (`(stroke …)`, `(uuid …)`, `(pts …)`) and a naive
+      // regex would close at the first `)`.
+      const start = src.indexOf("(wire ");
+      let mutated = src;
+      if (start >= 0) {
+        let depth = 0;
+        let end = -1;
+        for (let i = start; i < src.length; i++) {
+          if (src[i] === "(") depth++;
+          else if (src[i] === ")") {
+            depth--;
+            if (depth === 0) { end = i + 1; break; }
+          }
+        }
+        if (end > start) mutated = src.slice(0, start) + src.slice(end);
+      }
+      if (mutated === src) test.skip(true, "could not perturb the schematic to introduce an ERC violation");
+      fs.writeFileSync(schInTmp, mutated);
+
+      const r = spawnSync(CLI, ["check", "HEAD", schInTmp], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(r.stdout).toContain("(erc)");
+      // Exit 1 because there are NEW violations on the `to` side.
+      expect(r.status).toBe(1);
+      // The summary must show at least one added violation.
+      expect(r.stdout).toMatch(/\+[1-9]\d*\b/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("skips unsupported file types with a friendly note", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-skip-"));
+    try {
+      initRepoWithBlink(tmp);
+      // Drop a .kicad_sym next to the project — `check` doesn't run on
+      // symbol libs, so it should be silently or politely skipped.
+      const symFile = path.join(tmp, "stub.kicad_sym");
+      fs.writeFileSync(symFile, "(kicad_symbol_lib (version 20211014) (generator kicadiff_test))");
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "add", "stub.kicad_sym",
+      ], { cwd: tmp });
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-q", "-m", "add sym",
+      ], { cwd: tmp });
+
+      const r = spawnSync(CLI, ["check", "HEAD", "HEAD", symFile], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      // Skipping is fine; the only requirement is that the command doesn't
+      // crash and doesn't report a phantom violation.
+      expect(r.status).toBe(0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
