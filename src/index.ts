@@ -558,7 +558,26 @@ async function main(): Promise<void> {
     // the working tree, and has its own help text. Dispatch and exit
     // before the regular argument parser runs (which would reject
     // --older-than / --all as unknown options).
-    process.exit(runCache(argv.slice(1)));
+    //
+    // Wrap in try/catch so an EACCES / ENOTDIR from walkCache surfaces as
+    // the consistent `Error: ...` line used by the rest of the CLI rather
+    // than an unhandled exception + stack trace. (walkCache used to
+    // swallow these into an empty result, but doing so masked real
+    // permission problems as "(empty)"; surfacing them is the right
+    // policy, so the dispatcher just needs to format them.)
+    //
+    // TODO: top-level `import { runCache } from "./cache.ts"` still pulls
+    // in the render module transitively because the index entrypoint
+    // imports `./render.ts` unconditionally; making `kicadiff cache *`
+    // truly cold-start cheap needs the dispatch refactored to dynamic
+    // imports per-subcommand. Out of scope for this PR — affects the
+    // bun --compile bundling story.
+    try {
+      process.exit(runCache(argv.slice(1)));
+    } catch (e) {
+      console.error(`Error: ${(e as Error).message}`);
+      process.exit(1);
+    }
   }
 
   if (argv[0] === "hook") {

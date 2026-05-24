@@ -509,11 +509,13 @@ Subcommands:
                      (so any foreign files dropped under the root are also
                      wiped). Confirmation prompt unless --yes is provided;
                      --yes is required in non-TTY environments (CI) so the
-                     prompt can't hang a build. Refuses if the cache root
-                     has neither a .kicadiff-cache marker (auto-dropped on
-                     first cache write / read) nor any recognised entries
-                     — protects against a misconfigured KICADIFF_CACHE_DIR
-                     wiping an unrelated directory.
+                     prompt can't hang a build. Refuses unless the cache
+                     root has a regular-file .kicadiff-cache marker
+                     (auto-dropped on first cache write / read; a
+                     symlinked marker is rejected) — protects against a
+                     misconfigured KICADIFF_CACHE_DIR wiping an unrelated
+                     directory. --dry-run skips the guard so you can
+                     preview without first having to mark the directory.
     --dry-run        Print what would be deleted, change nothing on disk.
     --yes, -y        Skip the confirmation prompt for --all (required in
                      non-TTY environments).

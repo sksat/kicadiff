@@ -403,6 +403,35 @@ test.describe("cache stats — bucket-level files", () => {
   });
 });
 
+test.describe("cache subcommand error surfacing", () => {
+  // walkCache rethrows readdir failures (EACCES etc.) so permission
+  // problems don't silently look like "(empty)". The dispatcher in
+  // index.ts is responsible for turning those throws into the
+  // consistent `Error: ...` line the rest of the CLI uses — otherwise
+  // users see an unhandled exception + stack trace.
+  test("EACCES on the cache root surfaces as 'Error: ...' (not a stack trace)", () => {
+    // chmod 000 on the cache root so readdirSync fails with EACCES.
+    // Running as root would defeat this, so skip in that environment.
+    if (process.getuid && process.getuid() === 0) {
+      test.skip(true, "test requires non-root to enforce EACCES");
+      return;
+    }
+    fs.chmodSync(cacheDir, 0o000);
+    try {
+      const r = runCli(["cache", "stats"], { env: envWith() });
+      expect(r.status).not.toBe(0);
+      // Strip ANSI control codes some runtimes wrap stack-trace lines with.
+      const plain = r.stderr.replace(/\x1b\[[0-9;]*m/g, "");
+      expect(plain).toMatch(/Error: .*EACCES/);
+      // Stack traces start with "at " lines; the consistent CLI format
+      // should not include any.
+      expect(plain).not.toMatch(/^\s+at /m);
+    } finally {
+      fs.chmodSync(cacheDir, 0o755);
+    }
+  });
+});
+
 test.describe("cache prune --help", () => {
   test("help text describes --yes behaviour accurately", () => {
     const r = runCli(["cache", "prune", "--help"]);
