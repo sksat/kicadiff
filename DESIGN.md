@@ -144,16 +144,22 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
 変わったケース (`R1.2: GND → /LED_OUT`)」を出力する。Net の identity は
 **名前** で持つ — id は保存ごとに振り直されるため安定しない。
 
-(net ...) atom の形は KiCad のバージョンで 2 種ある:
+(net ...) atom の形は KiCad のバージョンで 3 種ある:
 
 - レガシー (KiCad <= 9): `(net <id> "<name>")` — 名前は index 2、
   さらにトップレベルに `(net N "name")` 表を持つ。
 - KiCad 10: `(net "<name>")` — 名前は index 1、トップレベルの
   net 表は消えた。
+- bare net id 参照: `(net <id>)` — 一部の zone 宣言などで使われる、
+  既存のネットを (再振りされる) 数値 id で指す形。**名前ではない**。
+  パーサは引用符を剥がすので、引用符無しの裸 atom は数値のみ
+  (`/^\d+$/`) で判定して名前集合からは除外する (実 KiCad ファイルでは
+  全数字のネット名は使われないので安全な heuristic)。
 
-両方サポートする。トップレベル表が無い場合は、PCB sexp 全体を歩いて
-すべての `(net ...)` membership (pad / segment / via / zone / track など)
-から名前集合を逆算する (`examples/mcu-board` がこの経路)。pad だけを見ると、
+最初の 2 つはサポート、3 つ目は除外。トップレベル表が無い場合は、
+PCB sexp 全体を歩いて すべての `(net ...)` membership (pad / segment /
+via / zone / track など) から名前集合を逆算する (`examples/mcu-board`
+がこの経路)。pad だけを見ると、
 copper にしか乗っていないネット (segment や zone のみで参照されているもの)
 を取りこぼし、後で pad が繋がった時点で擬似的な「追加されたネット」として
 報告してしまう。`padNets` は引き続き pad のみを対象にする — segment / via /

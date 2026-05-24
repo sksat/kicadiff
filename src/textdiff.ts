@@ -248,13 +248,25 @@ export function extractNets(src: string): NetInfo {
   const names = new Set<string>();
   const padNets = new Map<string, Map<string, string>>();
 
-  // The (net ...) atom comes in two shapes:
+  // The (net ...) atom comes in THREE shapes after parsing (quotes stripped):
   //   - Legacy (KiCad <= 9): `(net <id> "<name>")` — name is at index 2.
-  //   - KiCad 10:            `(net "<name>")`      — name is at index 1.
-  // Read whichever is present so we cover both formats.
+  //   - KiCad 10 name form:  `(net "<name>")`      — name is at index 1.
+  //   - Bare ID reference:   `(net <id>)`          — index 1 is a numeric ID,
+  //     NOT a name. Used in some zone declarations to point at an existing
+  //     net by its (transient) numeric id.
+  // Distinguish shape 3 from shape 2 by checking whether index 1 is a
+  // numeric-only string. KiCad never emits an unquoted bare integer as a
+  // *name*: a real name (even one that happens to be all digits) would be
+  // quoted, and the parser preserves that as a string atom either way —
+  // but real KiCad files don't use all-digit net names, so /^\d+$/ is a
+  // safe heuristic for "this was a bare net-id reference, skip it".
   const netName = (atom: Sexp[]): string | undefined => {
-    if (typeof atom[2] === "string") return atom[2];
-    if (typeof atom[1] === "string") return atom[1];
+    if (typeof atom[2] === "string") return atom[2]; // legacy 3-atom
+    if (typeof atom[1] === "string") {
+      // Bare numeric id (`(net 0)`) → not a name, skip.
+      if (/^\d+$/.test(atom[1])) return undefined;
+      return atom[1]; // KiCad 10 quoted-name 2-atom
+    }
     return undefined;
   };
 

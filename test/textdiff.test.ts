@@ -762,6 +762,94 @@ test.describe("extractNets covers segments / vias / zones (KiCad 10 fallback)", 
     expect(info.padNets.size).toBe(0);
   });
 
+  test("bare (net N) reference (e.g. zone (net 0)) is NOT mistaken for a KiCad 10 name", () => {
+    // Some zone declarations include a bare `(net 0)` atom — a numeric ID
+    // reference, NOT a name. Post-parse (the parser strips quotes) it looks
+    // identical to KiCad 10's `(net "0")` would, but the latter would never
+    // appear in real files: net names are quoted KiCad strings, and KiCad
+    // would never emit a name that's just a bare integer. The old netName
+    // logic stringified the numeric ID and added it to the name set,
+    // producing fake added/removed nets whenever zone IDs were renumbered.
+    const src = `(kicad_pcb (version 20260206) (generator "pcbnew")
+\t(zone
+\t\t(net 0)
+\t\t(layer "F.Cu")
+\t)
+\t(zone
+\t\t(net 1)
+\t\t(layer "F.Cu")
+\t)
+\t(footprint "lib:R"
+\t\t(layer "F.Cu")
+\t\t(uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+\t\t(at 0 0)
+\t\t(property "Reference" "R1"
+\t\t\t(at 0 -2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+\t\t)
+\t\t(property "Value" "10k"
+\t\t\t(at 0 2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "cccccccc-cccc-cccc-cccc-cccccccccccc")
+\t\t)
+\t\t(pad "1" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net "GND")
+\t\t\t(uuid "dddddddd-dddd-dddd-dddd-dddddddddddd")
+\t\t)
+\t)
+)
+`;
+    const info = extractNets(src);
+    // Real net name appears as expected.
+    expect(info.names.has("GND")).toBe(true);
+    // Bare numeric ID references must NOT pollute the name set.
+    expect(info.names.has("0")).toBe(false);
+    expect(info.names.has("1")).toBe(false);
+  });
+
+  test("legacy (net 0 \"\") (unconnected) is still excluded by the empty-name filter", () => {
+    // Regression: the bare-ID fix must not break the legacy 3-atom path.
+    // `(net 0 "")` is the unconnected net (id 0, empty quoted name) and
+    // gets filtered by the existing `name !== ""` check, not by the new
+    // numeric-only check (which only applies to the 2-atom shape).
+    const src = makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "VCC" }],
+      [{ ref: "R1", pads: [{ num: "1", net: { id: 1, name: "VCC" } }] }],
+    );
+    const info = extractNets(src);
+    expect(info.names.has("")).toBe(false);
+    expect(info.names.has("0")).toBe(false);
+    expect(info.names.has("VCC")).toBe(true);
+  });
+
+  test("legacy (net 1 \"VCC\") is still parsed as VCC (3-atom regression)", () => {
+    const src = makePcb(
+      [{ id: 1, name: "VCC" }],
+      [{ ref: "R1", pads: [{ num: "1", net: { id: 1, name: "VCC" } }] }],
+    );
+    const info = extractNets(src);
+    expect(info.names.has("VCC")).toBe(true);
+    expect(info.names.has("1")).toBe(false);
+  });
+
+  test("KiCad 10 (net \"GND\") (quoted name) is still parsed as GND", () => {
+    // The 2-atom name shape must continue to work — only numeric-only
+    // atoms in the 2-atom shape are skipped.
+    const src = `(kicad_pcb (version 20260206) (generator "pcbnew")
+\t(zone
+\t\t(net "GND")
+\t\t(layer "F.Cu")
+\t)
+)
+`;
+    const info = extractNets(src);
+    expect(info.names.has("GND")).toBe(true);
+  });
+
   test("real mcu-board fixture: every name appearing in any (net \"X\") atom is captured", () => {
     const fixtureSrc = fs.readFileSync(
       path.join(PROJECT_DIR, "examples/mcu-board/mcu-board.kicad_pcb"),
