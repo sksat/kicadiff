@@ -15,10 +15,22 @@
  * "Entry" here means a leaf directory containing at least `combined.png` —
  * the rest of the files in a leaf belong to the same cached render. The
  * size figure reported by `cache stats` is the sum of regular-file sizes
- * under the cache root (directories themselves contribute 0). Symlinks
- * are skipped (never followed), so the total reflects bytes physically
- * stored under the cache root — close to `du -sb <root>` minus link
- * targets, and never inflated by a link pointing elsewhere.
+ * contributed by recognised cache content only: top-level files directly
+ * under the root (sentinel, stray README) plus the contents of valid
+ * leaves under valid buckets. A "valid bucket" is a top-level directory
+ * whose name matches `^[0-9a-f]{2}$`; a "valid leaf" is a sub-directory
+ * whose name matches `^[0-9a-f]+$` AND which contains a `combined.png`
+ * marker. Foreign top-level directories (non-hex names) are NOT recursed
+ * into — a misconfigured KICADIFF_CACHE_DIR pointing at e.g. $HOME used
+ * to make `cache stats` appear to hang while it walked an unrelated
+ * tree. Foreign / non-marker leaf directories under valid buckets are
+ * likewise skipped: their bytes do NOT contribute to the reported total.
+ * Symlinks (file or dir, at any level) are always skipped — never
+ * followed and never counted — so the total can never be inflated by a
+ * link pointing elsewhere. The figure therefore under-reports raw
+ * `du -sb <root>` whenever foreign content sits under the cache root,
+ * which is by design; `cache prune --all` documents that it reclaims
+ * more than what `stats` shows.
  *
  * Sentinel: the `.kicadiff-cache` marker at the root exists so the
  * destructive `cache prune --all` cannot wipe a misconfigured
@@ -89,32 +101,43 @@ const LEAF_NAME_RE = /^[0-9a-f]+$/;
 export interface WalkResult {
   entries: CacheEntry[];
   /** Sum of regular file bytes contributed by recognised cache content
-   *  (bucket subtrees) plus any foreign top-level *files* (sentinel,
-   *  stray README, etc.). Foreign top-level **directories** are NOT
-   *  traversed — a misconfigured KICADIFF_CACHE_DIR (e.g. pointing at
-   *  $HOME) used to make `cache stats` recursively sum every byte in
-   *  an unrelated tree and could appear to hang on huge homedirs.
-   *  Anything sitting in a non-bucket subtree therefore goes
-   *  unaccounted for in this figure (it will still be wiped by
-   *  `cache prune --all`, which is documented to reclaim more than
-   *  what `stats` reports). */
+   *  only: the contents of every valid leaf (name matches LEAF_NAME_RE
+   *  AND contains a `combined.png` marker) under every valid bucket
+   *  (name matches BUCKET_NAME_RE), plus any foreign top-level *files*
+   *  (sentinel, stray README, etc.). Foreign top-level **directories**
+   *  are NOT traversed — a misconfigured KICADIFF_CACHE_DIR (e.g.
+   *  pointing at $HOME) used to make `cache stats` recursively sum
+   *  every byte in an unrelated tree and could appear to hang on huge
+   *  homedirs. Foreign / non-marker leaf directories under valid
+   *  buckets are likewise skipped: their bytes do NOT contribute here.
+   *  Symlinks (file or dir) are always skipped. Anything that didn't
+   *  pass the shape + marker check therefore goes unaccounted for in
+   *  this figure (it will still be wiped by `cache prune --all`, which
+   *  is documented to reclaim more than what `stats` reports). */
   totalSize: number;
 }
 
-/** Walk the cache and return one CacheEntry per leaf directory plus the
- *  total on-disk size of the cache root. A "leaf" is any
- *  `<bucket>/<rest>/` dir that contains a `combined.png` — that's the
- *  marker render.ts uses for a cache hit, so anything without it is
- *  either incomplete or not ours and we leave it alone (but still count
- *  its bytes towards totalSize).
+/** Walk the cache and return one CacheEntry per valid leaf directory
+ *  plus a totalSize that reflects only recognised cache content. A
+ *  "valid leaf" is a `<bucket>/<rest>/` directory whose name matches
+ *  LEAF_NAME_RE AND which contains a `combined.png` marker — that's
+ *  what render.ts writes on a cache hit. Both conditions must hold:
+ *  the name is validated AND the marker is `lstat`-checked BEFORE we
+ *  recurse with `sumDir`, so a directory that fails either check is
+ *  not traversed and its bytes do NOT contribute to totalSize.
+ *  Anything that fails the shape / marker check (incomplete writes,
+ *  stray non-hex directories, foreign content) is left alone for
+ *  `cache prune --all` to wipe via the recursive root rm, but stays
+ *  invisible to both `entries` and `totalSize`.
  *
  *  Single-pass: the previous implementation called `sumDir(leafPath)`
  *  here and `sumDir(cacheDir)` separately from `printStats`, which
- *  doubled filesystem I/O on large caches. We now sum the whole root
- *  once and remember per-leaf subtotals as we go.
+ *  doubled filesystem I/O on large caches. We now sum each valid leaf
+ *  once and accumulate the total as we go.
  *
  *  Traversal is hardened against escape: bucket/leaf names must match
- *  the hex shape the cache writer emits, and each directory check uses
+ *  the hex shape the cache writer emits, foreign top-level directories
+ *  are not recursed into at all, and each directory check uses
  *  `lstatSync` so a symlink under the cache root can't redirect the
  *  walk outside it.
  *
