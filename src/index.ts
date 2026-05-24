@@ -441,6 +441,18 @@ function parseArgs(argv: string[]): ParsedArgs {
     throw new Error(`bad ref: ${toRef}`);
   }
 
+  // --exit-code only has meaning for one-shot invocations: it signals
+  // "did anything change?" via the process exit status. --watch is a
+  // long-running mode that never exits on its own, so the combination
+  // is incoherent. Reject up front rather than silently dropping the
+  // flag — users mirroring `git diff --exit-code` muscle memory would
+  // otherwise be surprised when their CI wrapper hangs forever.
+  if (watch && exitCode) {
+    throw new Error(
+      "--exit-code is not compatible with --watch (watch is long-running; --exit-code only has meaning for one-shot invocations)",
+    );
+  }
+
   // Validate subcommand vs input extension when input is a single file.
   // Directory and .kicad_pro inputs skip this check (resolveInputs handles
   // scope-filtering). For sym/fp the file may also be a .pretty directory,
@@ -683,10 +695,15 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
     ? (s: string) => process.stderr.write(s + "\n")
     : (s: string) => console.log(s);
   let anyChanges = false;
+  // textDiff already parses both sides internally to produce its formatted
+  // output. The follow-up computeFileDiff parses them again to read the
+  // counts — cheap per file but doubles the parse work on large
+  // .kicad_pcb/.kicad_sch projects. Only pay that cost when --exit-code
+  // actually needs the verdict; the common --text-only path skips it.
+  const needCounts = !!parsed.exitCode;
   for (const f of files) {
     out(textDiff(f, fromRef, toRef, repoRoot));
-    // Recompute via computeFileDiff so we observe the same counts the text
-    // output prints. Cheap: parses the same two strings already read above.
+    if (!needCounts) continue;
     const fd = computeFileDiff(f, fromRef, toRef, repoRoot);
     if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
       anyChanges = true;

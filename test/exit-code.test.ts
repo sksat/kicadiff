@@ -176,4 +176,17 @@ test.describe("--exit-code flag", () => {
     ], { cwd: PROJECT_DIR, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     expect(r.status).not.toBe(0);
   });
+
+  test("--watch + --exit-code is rejected with a clear error", () => {
+    // --watch is a long-running mode where --exit-code has no defined
+    // meaning. Silently ignoring the flag would be surprising to anyone
+    // mirroring `git diff` muscle memory, so the combination must be
+    // rejected at parse time with a message that names both flags.
+    const r = spawnSync(CLI, [
+      "--watch", "--exit-code", PROJECT_FIXTURE_DIR,
+    ], { cwd: PROJECT_DIR, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("--exit-code");
+    expect(r.stderr).toContain("--watch");
+  });
 });
