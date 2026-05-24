@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath, resolveRefToSha } from "./render.ts";
 import type { LogLevel, ProjectRenderResult } from "./render.ts";
-import { textDiff, markdownDiff, computeFileDiff } from "./textdiff.ts";
+import { textDiff, markdownDiff, computeFileDiff, type FileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
 import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
 import type { FileType } from "./types.ts";
@@ -683,6 +683,28 @@ async function main(): Promise<void> {
   }
 }
 
+/** True iff a single file's structural diff carries a meaningful change.
+ *  Used by every `--exit-code` path (default render, --text-only, --md) so
+ *  that "what counts as a structural change" stays in one place.
+ *
+ *  Component edits (added / removed / changed footprints or symbols) AND
+ *  net-level edits (added/removed nets, pad rewires) both qualify: a pad
+ *  rewired from GND to VCC is a real electrical change even when no
+ *  component-level field moved. Mirrors the `has_structural_diff` definition
+ *  in buildMarkdownReport so the markdown template's `{{has_structural_diff}}`
+ *  flag and the CLI's `--exit-code` always agree. */
+function fileDiffHasChanges(fd: FileDiff): boolean {
+  if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+    return true;
+  }
+  if (fd.nets) {
+    if (fd.nets.added.length + fd.nets.removed.length + fd.nets.padChanges.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** True if any file in the rendered project shows a meaningful change.
  *  Mirrors the per-file `has_changes` definition exposed to markdown
  *  templates in buildMarkdownReport: structural diff, visual diff (PNG
@@ -709,9 +731,7 @@ function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): bo
     if (m.hasDiff) return true;
     if (m.type === "pcb" || m.type === "sch") {
       const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
-      if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
-        return true;
-      }
+      if (fileDiffHasChanges(fd)) return true;
     }
   }
   return false;
@@ -797,7 +817,9 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
     out(textDiff(f, fromRef, toRef, repoRoot));
     if (!needCounts) continue;
     const fd = computeFileDiff(f, fromRef, toRef, repoRoot);
-    if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+    // Includes net-level edits — see fileDiffHasChanges for why a pad
+    // rewire counts as a meaningful change even with no component delta.
+    if (fileDiffHasChanges(fd)) {
       anyChanges = true;
     }
   }

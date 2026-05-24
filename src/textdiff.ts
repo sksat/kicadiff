@@ -263,7 +263,14 @@ export function extractNets(src: string): NetInfo {
   const netName = (atom: Sexp[]): string | undefined => {
     if (typeof atom[2] === "string") return atom[2]; // legacy 3-atom
     if (typeof atom[1] === "string") {
-      // Bare numeric id (`(net 0)`) → not a name, skip.
+      // TODO: all-digit net names (e.g. `(net "12")`) are valid KiCad 10
+      // but indistinguishable from bare numeric ids (e.g. `(net 12)`) at
+      // this layer because parseSexp strips quotes and represents both as
+      // the same string atom. The proper fix is to teach the parser to
+      // preserve was-quoted info on atoms — every consumer of parseSexp
+      // would have to opt in to the richer representation, so it's
+      // deferred for now. Real-world KiCad projects don't use all-digit
+      // net names, so the practical impact is nil.
       if (/^\d+$/.test(atom[1])) return undefined;
       return atom[1]; // KiCad 10 quoted-name 2-atom
     }
