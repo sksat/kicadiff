@@ -867,6 +867,102 @@ test.describe("--md templating", () => {
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/nonexistent\/x\.tpl|ENOENT/);
   });
+
+  test("has_structural_diff / has_changes are true when ONLY nets change", () => {
+    // Custom templates that filter on has_structural_diff / has_changes
+    // must not silently drop a PCB whose only change is electrical
+    // connectivity (a pad rewired to a different net) with no
+    // footprint-level edit. The booleans are documented as "real
+    // structural change", and a net rewire absolutely qualifies.
+    //
+    // Build a minimal PCB inline, commit it, rewire one pad's net,
+    // and render the markdown report with a probe template that prints
+    // the boolean values.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-md-nets-"));
+    try {
+      const before = `(kicad_pcb (version 20240108) (generator "test")
+\t(net 0 "")
+\t(net 1 "VCC")
+\t(net 2 "GND")
+\t(footprint "lib:R"
+\t\t(layer "F.Cu")
+\t\t(uuid "00000000-0000-0000-0000-000000000001")
+\t\t(at 100 100)
+\t\t(property "Reference" "R1"
+\t\t\t(at 0 -2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "00000000-0000-0000-0000-00000000000a")
+\t\t)
+\t\t(property "Value" "330"
+\t\t\t(at 0 2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "00000000-0000-0000-0000-00000000000b")
+\t\t)
+\t\t(pad "1" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net 1 "VCC")
+\t\t\t(uuid "11111111-1111-1111-0000-000000000001")
+\t\t)
+\t\t(pad "2" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net 2 "GND")
+\t\t\t(uuid "11111111-1111-1111-0000-000000000002")
+\t\t)
+\t)
+)
+`;
+      // Only the pad-2 net assignment changes; everything component-level
+      // (ref, value, libId, pos, angle, even the (at ...) inside pads)
+      // stays identical so the component diff comes back empty.
+      const after = before.replace('(net 2 "GND")\n\t\t\t(uuid "11111111-1111-1111-0000-000000000002")',
+        '(net 1 "VCC")\n\t\t\t(uuid "11111111-1111-1111-0000-000000000002")');
+
+      const pcbPath = path.join(tmp, "board.kicad_pcb");
+      fs.writeFileSync(pcbPath, before);
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "add", "."], { cwd: tmp });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: tmp });
+      fs.writeFileSync(pcbPath, after);
+
+      // File template probe: emit the booleans as `sd=…|hc=…` per file.
+      const fileTpl = path.join(tmp, "file.tpl");
+      fs.writeFileSync(
+        fileTpl,
+        "sd={{#has_structural_diff}}1{{/has_structural_diff}}{{^has_structural_diff}}0{{/has_structural_diff}}|hc={{#has_changes}}1{{/has_changes}}{{^has_changes}}0{{/has_changes}}",
+      );
+      // Project template probe: emit the project-level has_changes flag.
+      const projTpl = path.join(tmp, "proj.tpl");
+      fs.writeFileSync(
+        projTpl,
+        "{{file_sections}}\nproject_hc={{#has_changes}}1{{/has_changes}}{{^has_changes}}0{{/has_changes}}\n",
+      );
+
+      const mdDir = path.join(tmp, "out");
+      fs.mkdirSync(mdDir);
+      // Use --images-only-equivalent? No, --md needs to actually render
+      // images. Use the CLI to produce the markdown report into mdDir.
+      const r = spawnSync(CLI,
+        ["pcb", "HEAD", pcbPath, "--output-dir", path.join(tmp, "renders"),
+         "--md", "--output", mdDir,
+         "--md-file-template", fileTpl, "--md-template", projTpl],
+        { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(0);
+      const reportFiles = fs.readdirSync(mdDir).filter(f => f.endsWith(".md"));
+      expect(reportFiles.length).toBe(1);
+      const md = fs.readFileSync(path.join(mdDir, reportFiles[0]), "utf8");
+      expect(md).toContain("sd=1");
+      expect(md).toContain("hc=1");
+      expect(md).toContain("project_hc=1");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // =============================================================================

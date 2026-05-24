@@ -122,8 +122,9 @@ kicadiff project/ --images-only         # PNGs only, no HTML / markdown
 # file_count / has_changes / files / file_sections. File template sees path /
 # type / before_image / after_image / has_both / after_only / before_only /
 # added_count / removed_count / changed_count / unchanged_count /
-# has_structural_diff (real component changes) / has_visual_diff (PNGs differ) /
-# has_changes (any of the above) / structural_diff (formatted body). Either
+# nets_added / nets_removed / nets_changed (pcb only) /
+# has_structural_diff (real component OR net changes) / has_visual_diff (PNGs
+# differ) / has_changes (any of the above) / structural_diff (formatted body). Either
 # flag is optional; the default template ships built-in.
 kicadiff project/ --md --md-template my-report.md.tpl
 kicadiff project/ --md --md-file-template my-file.md.tpl

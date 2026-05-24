@@ -87,8 +87,14 @@ kicadiff は orchestration とキャッシュと出力フォーマットの統�
      `has_both` / `after_only` / `before_only`
    - 構造差分の数: `added_count` / `removed_count` / `changed_count` /
      `unchanged_count`
+   - Net 差分の数 (pcb のみ、それ以外は 0): `nets_added` / `nets_removed` /
+     `nets_changed` (pad rewire 数; 追加/削除された footprint の pad は
+     suppress 済みで、レンダラの Nets サブセクションに出る数と一致)
    - 真偽: `has_structural_diff` (実際に追加/削除/変更があった場合のみ
-     true。PCB/SCH の `+0 -0 ~0 =N` summary 行は `structural_diff` 文字列
+     true。component の差分だけでなく net レベルの変更 (net 追加/削除/
+     pad rewire) も true にする — pad を GND から VCC へ繋ぎ替える編集
+     は component field が動いていなくても電気的には実変更だから。
+     PCB/SCH の `+0 -0 ~0 =N` summary 行は `structural_diff` 文字列
      には含まれるが、これだけでは false) / `has_visual_diff` (描画した
      before/after の PNG が byte 単位で異なる) / `has_changes` (上記の
      いずれか / 片側だけ存在も含む)

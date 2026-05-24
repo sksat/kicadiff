@@ -219,23 +219,21 @@ export function extractComponents(src: string, fileType: FileType): Component[] 
  *   - `padNets`   : map of `"<ref>.<padNum>"` → net name, again excluding
  *                   pads whose net is `""`. Identity is the pad identifier
  *                   so we can detect "this physical pad was rewired".
- *   - `componentRefs` : set of footprint refs present, used so the diff
- *                   layer can suppress pad-moved lines for pads whose
- *                   parent footprint was itself added or removed (avoids
- *                   emitting `R5.1 ""→GND` for every pad of a freshly
- *                   added R5; the footprint-level `+ R5` line covers it).
+ *
+ * Suppression of pad-changes belonging to added/removed footprints is done
+ * at the diff layer in `computeFileDiff` using `result.diff.added` /
+ * `result.diff.removed` directly, so we don't need to carry a footprint
+ * ref set on this snapshot.
  */
 export interface NetInfo {
   names: Set<string>;
   padNets: Map<string, string>;
-  componentRefs: Set<string>;
 }
 
 export function extractNets(src: string): NetInfo {
   const tree = parseSexp(src);
   const names = new Set<string>();
   const padNets = new Map<string, string>();
-  const componentRefs = new Set<string>();
 
   // The (net ...) atom comes in two shapes:
   //   - Legacy (KiCad <= 9): `(net <id> "<name>")` — name is at index 2.
@@ -264,7 +262,6 @@ export function extractNets(src: string): NetInfo {
   walk(tree, "footprint", node => {
     const ref = findProperty(node, "Reference") ?? "";
     if (!ref) return;
-    componentRefs.add(ref);
     for (const child of node) {
       if (!Array.isArray(child) || child[0] !== "pad") continue;
       const padNum = typeof child[1] === "string" ? child[1] : "";
@@ -285,7 +282,7 @@ export function extractNets(src: string): NetInfo {
     }
   });
 
-  return { names, padNets, componentRefs };
+  return { names, padNets };
 }
 
 export interface NetDiff {
@@ -418,7 +415,7 @@ export function computeFileDiff(
   const result: FileDiff = { fileType, rel, diff: diffComponents(before, after) };
 
   if (fileType === "pcb") {
-    const empty = { names: new Set<string>(), padNets: new Map<string, string>(), componentRefs: new Set<string>() };
+    const empty: NetInfo = { names: new Set<string>(), padNets: new Map<string, string>() };
     const beforeNets = beforeSrc ? extractNets(beforeSrc) : empty;
     const afterNets = afterSrc ? extractNets(afterSrc) : empty;
     const netDiff = diffNets(beforeNets, afterNets);

@@ -102,9 +102,11 @@ kicadiff project/ --images-only         # PNG だけ、HTML / markdown なし
 # files / file_sections が見える。file テンプレートからは path / type /
 # before_image / after_image / has_both / after_only / before_only /
 # added_count / removed_count / changed_count / unchanged_count /
-# has_structural_diff (実際の component 変更あり) / has_visual_diff
-# (PNG が異なる) / has_changes (上記いずれか) / structural_diff (整形済
-# 本文) が見える。どちらも省略可でデフォルトテンプレートは内蔵。
+# nets_added / nets_removed / nets_changed (pcb のみ) /
+# has_structural_diff (実際の component または net 変更あり) /
+# has_visual_diff (PNG が異なる) / has_changes (上記いずれか) /
+# structural_diff (整形済本文) が見える。どちらも省略可で
+# デフォルトテンプレートは内蔵。
 kicadiff project/ --md --md-template my-report.md.tpl
 kicadiff project/ --md --md-file-template my-file.md.tpl
 

@@ -107,7 +107,8 @@ Options:
                          each file with: path, type, before_image, after_image,
                          has_before, has_after, has_both, after_only, before_only,
                          added_count, removed_count, changed_count, unchanged_count,
-                         has_structural_diff (real component changes exist),
+                         nets_added, nets_removed, nets_changed (pcb only),
+                         has_structural_diff (real component OR net changes exist),
                          has_visual_diff (rendered PNGs differ), has_changes (any
                          of the above), and structural_diff (the formatted body).
                          The result fills {{file_sections}} in the project template.
@@ -855,11 +856,21 @@ interface FileTemplateContext extends Record<string, unknown> {
   removed_count: number;
   changed_count: number;
   unchanged_count: number;
+  /** Net-level diff counts (pcb only; 0 for sch/sym/fp). `nets_changed`
+   *  counts pad-rewires after suppression of pads on added/removed
+   *  footprints — i.e. the same number the renderer prints in the Nets
+   *  subsection. */
+  nets_added: number;
+  nets_removed: number;
+  nets_changed: number;
   /** True iff the structural diff has at least one added / removed / changed
-   *  component. Use this to filter out unchanged files in custom templates.
-   *  Distinct from `structural_diff` being non-empty: unchanged pcb/sch files
-   *  still emit a `+0 -0 ~0 =N` summary line, so `structural_diff` is non-
-   *  empty even when `has_structural_diff` is false. */
+   *  component OR (for pcb) at least one net-level change (added net,
+   *  removed net, or pad rewired). Use this to filter out unchanged files
+   *  in custom templates. Distinct from `structural_diff` being non-empty:
+   *  unchanged pcb/sch files still emit a `+0 -0 ~0 =N` summary line, so
+   *  `structural_diff` is non-empty even when `has_structural_diff` is
+   *  false. Net changes count because a pad rewire is a real electrical
+   *  edit even when no component-level field moved. */
   has_structural_diff: boolean;
   /** True when the rendered before/after PNG bytes differ. */
   has_visual_diff: boolean;
@@ -932,6 +943,9 @@ function buildMarkdownReport(
     let removedCount = 0;
     let changedCount = 0;
     let unchangedCount = 0;
+    let netsAdded = 0;
+    let netsRemoved = 0;
+    let netsChanged = 0;
     let structuralDiff = "";
     if (m.type === "pcb" || m.type === "sch") {
       const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
@@ -939,6 +953,11 @@ function buildMarkdownReport(
       removedCount = fd.diff.removed.length;
       changedCount = fd.diff.changed.length;
       unchangedCount = fd.diff.unchanged;
+      if (fd.nets) {
+        netsAdded = fd.nets.added.length;
+        netsRemoved = fd.nets.removed.length;
+        netsChanged = fd.nets.padChanges.length;
+      }
 
       const struct = markdownDiff(r.filePath, fromRef, toRef, repoRoot)
         .split("\n");
@@ -951,7 +970,12 @@ function buildMarkdownReport(
       structuralDiff = struct.join("\n");
     }
 
-    const hasStructuralDiff = (addedCount + removedCount + changedCount) > 0;
+    // Net-level changes are real structural edits — a pad rewired from GND
+    // to VCC is an electrical change worth surfacing even if no
+    // component-level field moved. Custom templates that filter on
+    // has_structural_diff / has_changes used to drop these PCBs silently.
+    const hasStructuralDiff =
+      (addedCount + removedCount + changedCount + netsAdded + netsRemoved + netsChanged) > 0;
     const hasVisualDiff = !!m.hasDiff;
     // "Has changes" = any meaningful difference. A file with both sides but
     // identical content has none of these; a renamed/added/deleted file has
@@ -978,6 +1002,9 @@ function buildMarkdownReport(
       removed_count: removedCount,
       changed_count: changedCount,
       unchanged_count: unchangedCount,
+      nets_added: netsAdded,
+      nets_removed: netsRemoved,
+      nets_changed: netsChanged,
       has_structural_diff: hasStructuralDiff,
       has_visual_diff: hasVisualDiff,
       has_changes: hasChanges,
