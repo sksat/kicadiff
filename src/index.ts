@@ -627,12 +627,19 @@ async function main(): Promise<void> {
       // diff to stderr too so it doesn't get prepended to the .md file.
       printTextDiff(parsed, stdoutIsReport ? "stderr" : "stdout");
     }
+    // Track whether the markdown path already computed the per-file change
+    // verdict. When it has, `projectHasChanges` can reuse the result instead
+    // of re-running `computeFileDiff` for every pcb/sch file — that work
+    // already happened inside `buildMarkdownReport`, and on large projects
+    // it's the dominant cost.
+    let mdHasChanges: boolean | undefined;
     if (parsed.markdown) {
       if (!quiet && !stdoutIsReport) newline("");
-      emitMarkdownReport(parsed, project);
+      mdHasChanges = emitMarkdownReport(parsed, project);
     }
-    if (parsed.exitCode && projectHasChanges(parsed, project)) {
-      process.exit(1);
+    if (parsed.exitCode) {
+      const changed = mdHasChanges ?? projectHasChanges(parsed, project);
+      if (changed) process.exit(1);
     }
   } catch (e) {
     console.error(`Error: ${(e as Error).message}`);
@@ -645,7 +652,12 @@ async function main(): Promise<void> {
  *  templates in buildMarkdownReport: structural diff, visual diff (PNG
  *  bytes differ), or one side missing entirely. Kept in sync with that
  *  definition so `--exit-code` and the markdown `{{has_changes}}` flag
- *  always agree about what counts as a change. */
+ *  always agree about what counts as a change.
+ *
+ *  Only called when the markdown path didn't already compute the verdict —
+ *  `emitMarkdownReport` returns the same answer as a by-product of building
+ *  the report, so the caller in main() prefers that to avoid re-parsing
+ *  every pcb/sch file twice. */
 function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): boolean {
   const repoRoot = project.results[0] ? repoRootOf(project.results[0].filePath) : null;
   // parsed.{from,to}Ref are already pinned at the top of main(); fall back
@@ -787,11 +799,22 @@ interface FileTemplateContext extends Record<string, unknown> {
  *  are joined with `\n\n`, and that string fills `{{file_sections}}` in the
  *  project template. Custom templates from --md-template / --md-file-template
  *  override the bundled defaults. */
+/** Result of building the markdown report. `hasChanges` mirrors the per-file
+ *  `has_changes` definition (structural diff, visual diff, or one side
+ *  missing) aggregated across the project — same answer `projectHasChanges`
+ *  would arrive at, but obtained as a by-product of the work the markdown
+ *  path already did. Surfaced so `--exit-code` in the markdown path can
+ *  skip the redundant `computeFileDiff` sweep. */
+interface MarkdownReportResult {
+  text: string;
+  hasChanges: boolean;
+}
+
 function buildMarkdownReport(
   parsed: ParsedArgs,
   project: ProjectRenderResult,
   mdDir: string,
-): string {
+): MarkdownReportResult {
   const repoRoot = project.results[0]
     ? repoRootOf(project.results[0].filePath)
     : null;
@@ -885,17 +908,19 @@ function buildMarkdownReport(
 
   const sections = fileContexts.map((ctx) => renderTemplate(fileTemplate, ctx));
   const fileSections = sections.join("\n\n");
+  const hasChanges = fileContexts.some((c) => c.has_changes);
 
-  return renderTemplate(projectTemplate, {
+  const text = renderTemplate(projectTemplate, {
     from_ref: fromRef,
     to_ref: toRef,
     from_label: fromLabel,
     to_label: toLabel,
     file_count: fileContexts.length,
-    has_changes: fileContexts.some((c) => c.has_changes),
+    has_changes: hasChanges,
     files: fileContexts,
     file_sections: fileSections,
   });
+  return { text, hasChanges };
 }
 
 /** Project-level filename for the combined markdown — kept in sync with the
@@ -914,14 +939,19 @@ function projectSafeNameFromResults(project: ProjectRenderResult): string {
 /** Emit the markdown report. Default destination is a file alongside the
  *  rendered images (parallel to the HTML viewer); `--output - / stdout`
  *  redirects to standard output, with image paths relative to CWD so the
- *  user can pipe / redirect somewhere predictable. */
-function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): void {
+ *  user can pipe / redirect somewhere predictable.
+ *
+ *  Returns whether any per-file change was detected, so the caller can
+ *  reuse the verdict for `--exit-code` instead of re-running the
+ *  structural diff. */
+function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): boolean {
   const outArg = parsed.outputHtml; // unified --output / -o flag
   const isStdout = outArg === "-" || outArg === "stdout";
 
   if (isStdout) {
-    process.stdout.write(buildMarkdownReport(parsed, project, process.cwd()));
-    return;
+    const report = buildMarkdownReport(parsed, project, process.cwd());
+    process.stdout.write(report.text);
+    return report.hasChanges;
   }
 
   const outDir = project.results[0]?.outputDir ?? process.cwd();
@@ -930,10 +960,12 @@ function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): v
     ? resolveOutputPath(outArg, `${safeName}_diff.md`)
     : path.join(outDir, `${safeName}_diff.md`);
   fs.mkdirSync(path.dirname(mdPath), { recursive: true });
-  fs.writeFileSync(mdPath, buildMarkdownReport(parsed, project, path.dirname(mdPath)));
+  const report = buildMarkdownReport(parsed, project, path.dirname(mdPath));
+  fs.writeFileSync(mdPath, report.text);
   if ((parsed.logLevel ?? "info") !== "quiet") {
     console.log(`Diff markdown: ${mdPath}`);
   }
+  return report.hasChanges;
 }
 
 function repoRootOf(filePath: string): string | null {
