@@ -88,11 +88,16 @@ const LEAF_NAME_RE = /^[0-9a-f]+$/;
 
 export interface WalkResult {
   entries: CacheEntry[];
-  /** Sum of every regular file byte under the cache root — including
-   *  the sentinel, foreign top-level files, and bytes inside dirs whose
-   *  names didn't match the cache layout. `cache stats` reports this so
-   *  the figure reflects on-disk footprint rather than "registered
-   *  entries only" (the latter would understate reclaimable bytes). */
+  /** Sum of regular file bytes contributed by recognised cache content
+   *  (bucket subtrees) plus any foreign top-level *files* (sentinel,
+   *  stray README, etc.). Foreign top-level **directories** are NOT
+   *  traversed — a misconfigured KICADIFF_CACHE_DIR (e.g. pointing at
+   *  $HOME) used to make `cache stats` recursively sum every byte in
+   *  an unrelated tree and could appear to hang on huge homedirs.
+   *  Anything sitting in a non-bucket subtree therefore goes
+   *  unaccounted for in this figure (it will still be wiped by
+   *  `cache prune --all`, which is documented to reclaim more than
+   *  what `stats` reports). */
   totalSize: number;
 }
 
@@ -140,10 +145,13 @@ export function walkCache(cacheDir: string): WalkResult {
     }
     if (!topSt.isDirectory()) continue;
     if (!BUCKET_NAME_RE.test(top.name)) {
-      // Foreign top-level directory: don't traverse it as a bucket (so
-      // it can't produce entries), but still sum its bytes — they live
-      // under the cache root and `--all` will delete them.
-      totalSize += sumDir(topPath).size;
+      // Foreign top-level directory: don't traverse it at all. The cache
+      // layout is strict (`<hash[0:2]>/<hash[2:]>/`), so a non-hex dir
+      // is not ours. The previous behaviour recursively summed it for
+      // `totalSize`, which on a misconfigured KICADIFF_CACHE_DIR (e.g.
+      // $HOME) could walk a huge unrelated tree and appear to hang.
+      // `cache prune --all` will still wipe the dir via the recursive
+      // root rm — `stats` just under-reports its bytes by design.
       continue;
     }
     const bucketPath = topPath;
@@ -237,16 +245,20 @@ export function formatSize(bytes: number): string {
 /** Format an age in milliseconds as a short human label ("3 days", "5
  *  hours", "just now"). Used in `cache stats` next to oldest/newest.
  *  Anything under a minute collapses to "just now" — second-precision
- *  ages aren't actionable for cache management and "0s" reads as a bug. */
+ *  ages aren't actionable for cache management and "0s" reads as a bug.
+ *
+ *  Long-form unit names (matches the "just now" sibling) and
+ *  singularised when the value is exactly 1 — `1 hours` / `1 days`
+ *  reads as a grammar bug in user-facing output. */
 export function formatAge(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
   if (sec < 60) return "just now";
   const min = Math.floor(sec / 60);
-  if (min < 60) return `${min} min`;
+  if (min < 60) return `${min} ${min === 1 ? "minute" : "minutes"}`;
   const hr = Math.floor(min / 60);
-  if (hr < 48) return `${hr} hours`;
+  if (hr < 48) return `${hr} ${hr === 1 ? "hour" : "hours"}`;
   const day = Math.floor(hr / 24);
-  return `${day} days`;
+  return `${day} ${day === 1 ? "day" : "days"}`;
 }
 
 /** Parse a duration like "30d", "12h", "45m", "30s" into milliseconds.
@@ -524,33 +536,35 @@ function runPrune(argv: string[]): number {
     // Safety guard: `--all` recursively deletes the cache root. A
     // misconfigured `KICADIFF_CACHE_DIR` (e.g. pointing at $HOME by
     // mistake) must not silently wipe an unrelated directory. We
-    // require a `.kicadiff-cache` sentinel at the root. Pre-sentinel
-    // caches auto-upgrade: walkCache drops the marker on read, and any
-    // dir containing valid leaf entries is unambiguously a kicadiff
-    // cache. So: if the sentinel is missing AND there are no
-    // recognised leaves, refuse and tell the user how to override
-    // (a manual `rm -rf` if they really mean it).
+    // require a `.kicadiff-cache` sentinel at the root.
+    //
+    // Important: this check uses fs.existsSync directly rather than
+    // calling walkCache. Even a hostile root (a giant unrelated tree)
+    // must not make the guard scan anything — the check has to be
+    // O(1) so the guard always completes promptly. Pre-sentinel
+    // caches auto-upgrade via any prior `cache stats` / cache read,
+    // which drops the sentinel; users on a pre-sentinel cache who
+    // jump straight to `--all` need to either run `cache stats` first
+    // or `touch <root>/.kicadiff-cache` to opt in.
     //
     // dry-run skips the guard so users can preview what `--all` would
     // do without first having to mark the directory.
     if (!dryRun) {
       const sentinel = path.join(cacheDir, SENTINEL_NAME);
       if (!fs.existsSync(sentinel)) {
-        // walkCache auto-installs the sentinel when it finds leaves;
-        // call it before giving up so pre-sentinel caches keep working.
-        walkCache(cacheDir);
-        if (!fs.existsSync(sentinel)) {
-          console.error(
-            `Error: refusing to recursively delete ${cacheDir} — it has no ${SENTINEL_NAME} marker and no recognised cache entries.`,
-          );
-          console.error(
-            "This guard exists so a misconfigured KICADIFF_CACHE_DIR can't silently wipe an unrelated directory.",
-          );
-          console.error(
-            `If you really mean to delete this directory, run \`rm -rf ${cacheDir}\` manually.`,
-          );
-          return 1;
-        }
+        console.error(
+          `Error: refusing to recursively delete ${cacheDir} — it has no ${SENTINEL_NAME} marker.`,
+        );
+        console.error(
+          "This guard exists so a misconfigured KICADIFF_CACHE_DIR can't silently wipe an unrelated directory.",
+        );
+        console.error(
+          `If this is a pre-existing kicadiff cache, run \`kicadiff cache stats\` once to auto-install the marker, then retry.`,
+        );
+        console.error(
+          `If you really mean to delete this directory, run \`rm -rf ${cacheDir}\` manually.`,
+        );
+        return 1;
       }
     }
     // Destructive: require explicit confirmation. In non-TTY environments

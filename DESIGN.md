@@ -555,14 +555,17 @@ leaf を削除した後、空になった bucket dir (`<hash[0:2]>/`) も rmdir
 "すべて" 消すことを保証する (advertised behaviour に一致させる)。
 
 `--all` の安全装置として、キャッシュ root に `.kicadiff-cache`
-sentinel file が無くかつ認識可能な leaf が一つも無い場合は削除を
-拒否する。これは `KICADIFF_CACHE_DIR` を誤って `$HOME` 等に設定して
-しまった場合に無関係なディレクトリを丸ごと吹き飛ばすのを防ぐため。
-sentinel は初回 cache write 時 (`saveToCache`) および初回 read 時
-(`walkCache`、認識可能な leaf を見つけたとき) に best-effort で配置
-されるので、本 PR 以前から存在するキャッシュも次回利用時に自動で
-upgrade される。ユーザーが本当に対象ディレクトリを消したい場合は
-`rm -rf` を手動で実行する。
+sentinel file が無い場合は削除を拒否する。これは
+`KICADIFF_CACHE_DIR` を誤って `$HOME` 等に設定してしまった場合に
+無関係なディレクトリを丸ごと吹き飛ばすのを防ぐため。判定は
+`fs.existsSync` での **O(1) チェックのみ** で、`walkCache` は呼ばない:
+仮に root が巨大な無関係ツリー (例: `$HOME`) でも guard 自体は瞬時に
+返るため、ユーザーは「`cache prune --all` が hang した」と感じない。
+sentinel は初回 cache write 時 (`saveToCache`) および任意の cache
+read 時 (`walkCache` が認識可能な leaf を見つけたとき) に
+best-effort で配置されるので、本 PR 以前から存在するキャッシュも
+一度 `cache stats` を実行すれば自動で upgrade される。ユーザーが本当
+に対象ディレクトリを消したい場合は `rm -rf` を手動で実行する。
 
 `cache stats` が読み出すサイズは `walkCache` の単一 traversal で
 算出する: 以前の実装は leaf ごとに `sumDir` を呼んだ後さらに root
@@ -576,6 +579,14 @@ walk 自体も traversal escape に対して防御してある: bucket 名は厳
 symlink は辿らない。`sumDir` も `lstat` ベースで symlink を一切カウント
 しないので、`cache stats` のサイズは「実体としてキャッシュ root 配下に
 ある bytes」だけを表す (link の指す先まで含めて膨らむことはない)。
+さらに、bucket 名にマッチしない top-level directory (例: 誤設定された
+`KICADIFF_CACHE_DIR` 配下の任意のサブツリー) には**一切 recurse しない**
+— totalSize には valid bucket subtree と top-level の foreign file
+のみを加算する。これにより `cache stats` が無関係な巨大ディレクトリを
+走査して hang したように見える事故を防ぐ。トレードオフとして、
+`cache prune --all` の実 reclaim 量は `stats` の "Total size" を
+上回る可能性がある (root を `rm -rf` するので foreign subtree も
+含めて消える)。
 
 エントリ削除に失敗した場合 (`rmSync` が例外) は失敗を stderr に出力し、
 件数をカウントして `runCache` が non-zero で抜ける。`Deleted: N` の N

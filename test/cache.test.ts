@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatAge } from "../src/cache.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,7 +46,12 @@ function runCli(
 }
 
 /** Create a fake cache leaf entry at `<root>/<hash[0:2]>/<hash[2:]>/combined.png`
- *  with the given byte size and mtime. Returns the leaf directory path. */
+ *  with the given byte size and mtime. Returns the leaf directory path.
+ *
+ *  Also drops the `.kicadiff-cache` sentinel at the root — mirrors what
+ *  the real `saveToCache` in render.ts does, so the test fixtures look
+ *  like real caches (the `--all` guard now relies on the sentinel being
+ *  present and no longer auto-upgrades on the destructive path). */
 function makeEntry(
   root: string,
   hash: string,
@@ -62,6 +68,8 @@ function makeEntry(
   fs.utimesSync(png, t, t);
   fs.utimesSync(svg, t, t);
   fs.utimesSync(leafDir, t, t);
+  const sentinel = path.join(root, ".kicadiff-cache");
+  if (!fs.existsSync(sentinel)) fs.writeFileSync(sentinel, "");
   return leafDir;
 }
 
@@ -264,6 +272,33 @@ test.describe("cache stats — traversal safety", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/Entries:\s+1\b/);
   });
+
+  test("foreign top-level directories are not recursed into for total size", () => {
+    // A misconfigured KICADIFF_CACHE_DIR (e.g. pointing at $HOME) used to
+    // make `cache stats` recursively sum every byte under foreign top-level
+    // dirs, which could appear to hang on huge unrelated trees. Foreign
+    // top-level dirs must be skipped entirely for size accounting; only
+    // valid bucket content and top-level files contribute.
+    const now = Date.now();
+    // A small, real cache entry so the cache is recognised.
+    makeEntry(cacheDir, "aa11111111", 100, now);
+
+    // A foreign top-level directory containing a "big" file. If walkCache
+    // recurses into it the total size will balloon past a MiB.
+    const foreignDir = path.join(cacheDir, "huge-foreign-tree");
+    fs.mkdirSync(path.join(foreignDir, "nested", "deeper"), { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignDir, "nested", "deeper", "big"),
+      Buffer.alloc(4 * 1024 * 1024, 0), // 4 MiB
+    );
+
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Entries:\s+1\b/);
+    // 4 MiB lives inside the foreign top-level dir; the report must NOT
+    // include it. So total size must be under 1 MiB.
+    expect(r.stdout).not.toMatch(/Total size:\s+[\d.]+\s*(MiB|GiB|TiB)/);
+  });
 });
 
 test.describe("cache prune --help", () => {
@@ -313,8 +348,13 @@ test.describe("cache prune --all sentinel safety", () => {
     // Existing caches that pre-date this PR will have leaves but no
     // sentinel. Any cache read (stats, prune) must drop the sentinel so
     // a subsequent `--all` works without manual intervention.
+    //
+    // makeEntry now drops the sentinel itself (to mirror the real
+    // saveToCache writer), so we strip it here to simulate the
+    // pre-sentinel state and then verify stats re-installs it.
     const now = Date.now();
     makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+    fs.rmSync(path.join(cacheDir, ".kicadiff-cache"), { force: true });
     expect(fs.existsSync(path.join(cacheDir, ".kicadiff-cache"))).toBe(false);
 
     const r = runCli(["cache", "stats"], { env: envWith() });
@@ -333,5 +373,26 @@ test.describe("formatAge", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("just now");
     expect(r.stdout).not.toMatch(/\(\d+s\)/);
+  });
+
+  // Unit-level coverage for singular vs plural: the user-visible `cache
+  // stats` line previously read "1 hours" / "1 days", which is a small
+  // but jarring grammatical error. Singularise when the value is 1.
+  test("singular vs plural unit forms", () => {
+    const MIN = 60 * 1000;
+    const HOUR = 60 * MIN;
+    const DAY = 24 * HOUR;
+
+    // minutes
+    expect(formatAge(MIN)).toBe("1 minute");
+    expect(formatAge(2 * MIN)).toBe("2 minutes");
+
+    // hours
+    expect(formatAge(HOUR)).toBe("1 hour");
+    expect(formatAge(2 * HOUR)).toBe("2 hours");
+
+    // days (formatAge switches to days at >= 48h)
+    expect(formatAge(2 * DAY)).toBe("2 days");
+    expect(formatAge(7 * DAY)).toBe("7 days");
   });
 });
