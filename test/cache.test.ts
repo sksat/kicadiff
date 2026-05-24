@@ -197,6 +197,40 @@ test.describe("cache prune", () => {
     expect(fs.existsSync(path.join(cacheDir, "bb"))).toBe(true);
   });
 
+  test("--all --dry-run reports foreign top-level entries that would also be wiped", () => {
+    // Comment B (round 4): `--all` recursively removes the cache root,
+    // taking any foreign files / directories with it. The dry-run summary
+    // was previously derived only from recognised cache entries, so it
+    // under-reported the real --all impact. The output must mention the
+    // foreign top-level entries (by count or by name) so the user is not
+    // misled.
+    const now = Date.now();
+    makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+    // Foreign top-level file.
+    fs.writeFileSync(path.join(cacheDir, "README"), "stray content");
+    // Foreign top-level directory.
+    const strayDir = path.join(cacheDir, "scratch");
+    fs.mkdirSync(strayDir, { recursive: true });
+    fs.writeFileSync(path.join(strayDir, "x"), "x");
+
+    const r = runCli(["cache", "prune", "--all", "--dry-run"], {
+      env: envWith(),
+    });
+    expect(r.status).toBe(0);
+    // Must surface that foreign entries would also be wiped — either by
+    // listing them or by counting them. The two foreign entries here are
+    // README and scratch/ (the sentinel file is excluded from the count).
+    expect(r.stdout.toLowerCase()).toMatch(/foreign/);
+    // Either explicit names appear, or a count of >= 2 is mentioned.
+    const mentionsNames =
+      r.stdout.includes("README") && r.stdout.includes("scratch");
+    const mentionsCount = /\b2\b/.test(r.stdout);
+    expect(mentionsNames || mentionsCount).toBe(true);
+    // Dry-run: nothing should actually be deleted.
+    expect(fs.existsSync(path.join(cacheDir, "README"))).toBe(true);
+    expect(fs.existsSync(strayDir)).toBe(true);
+  });
+
   test("--all wipes foreign files at the cache root too", () => {
     // A real user (or a botched earlier run) may drop unexpected files
     // directly under the cache root. `--all` advertises wiping the entire
@@ -271,6 +305,33 @@ test.describe("cache stats — traversal safety", () => {
     const r = runCli(["cache", "stats"], { env: envWith() });
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/Entries:\s+1\b/);
+  });
+
+  test("foreign directory under a valid 2-hex bucket is not recursed into", () => {
+    // Comment A (round 4): the previous implementation called sumDir() on a
+    // leaf directory BEFORE validating the leaf name / combined.png marker,
+    // so a non-cache directory living under a valid 2-hex bucket name (e.g.
+    // a user's pre-existing `aa/` dir if KICADIFF_CACHE_DIR was misrouted)
+    // would still trigger a full recursive scan. Mirrors the foreign top-
+    // level dir guard from the previous round, but at the leaf level.
+    const now = Date.now();
+    makeEntry(cacheDir, "bb11111111", 100, now);
+
+    // Foreign directory under a valid hex bucket name. Its name is not hex,
+    // so it is not a real cache leaf. It contains a "big" file (4 MiB).
+    const foreignLeaf = path.join(cacheDir, "ab", "some-non-hex-name");
+    fs.mkdirSync(foreignLeaf, { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignLeaf, "big-file"),
+      Buffer.alloc(4 * 1024 * 1024, 0),
+    );
+
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Entries:\s+1\b/);
+    // 4 MiB lives inside the foreign leaf dir; the report must NOT
+    // include it. So total size must be under 1 MiB.
+    expect(r.stdout).not.toMatch(/Total size:\s+[\d.]+\s*(MiB|GiB|TiB)/);
   });
 
   test("foreign top-level directories are not recursed into for total size", () => {

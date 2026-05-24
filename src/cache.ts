@@ -169,8 +169,16 @@ export function walkCache(cacheDir: string): WalkResult {
         continue;
       }
       if (!ls.isDirectory()) continue;
-      const { size: leafSize, newest } = sumDir(leafPath);
-      totalSize += leafSize;
+      // Validate the leaf name AND the combined.png marker BEFORE
+      // recursing with sumDir. The previous order called sumDir first,
+      // so a foreign directory living under a valid 2-hex bucket name
+      // (e.g. a user's pre-existing `aa/some-non-hex-name/` if
+      // KICADIFF_CACHE_DIR was misrouted) still triggered a full
+      // recursive scan. Mirrors the foreign top-level-dir skip pattern
+      // above: anything that doesn't pass the shape check is not ours,
+      // so don't pay the I/O. `cache prune --all` will still wipe it
+      // via the recursive root rm — `stats` just under-reports its
+      // bytes by design.
       if (!LEAF_NAME_RE.test(leaf)) continue;
       const marker = path.join(leafPath, "combined.png");
       // Marker existence: lstat so a symlinked combined.png doesn't trick
@@ -178,6 +186,8 @@ export function walkCache(cacheDir: string): WalkResult {
       let markerSt: fs.Stats;
       try { markerSt = fs.lstatSync(marker); } catch { continue; }
       if (!markerSt.isFile()) continue;
+      const { size: leafSize, newest } = sumDir(leafPath);
+      totalSize += leafSize;
       entries.push({
         path: leafPath,
         size: leafSize,
@@ -192,6 +202,45 @@ export function walkCache(cacheDir: string): WalkResult {
   // safety guard can still refuse an unrelated directory.
   if (entries.length > 0) ensureSentinel(cacheDir);
   return { entries, totalSize };
+}
+
+/** Enumerate top-level entries under `cacheDir` that are NOT recognised
+ *  cache content — i.e. anything other than a valid 2-hex bucket
+ *  directory or the sentinel marker. Returns just the *names* (with a
+ *  trailing `/` on directories) so the caller can list / count them
+ *  without ever recursing — the whole point is to surface what
+ *  `cache prune --all` would also wipe, without re-introducing the
+ *  "could hang on huge unrelated trees" cost the bucket-name guard
+ *  exists to avoid.
+ *
+ *  Symlinks are reported by name (they're real top-level entries that
+ *  `--all` will remove), but their targets are NOT traversed. The
+ *  sentinel file is filtered out — it's an implementation detail of
+ *  the safety guard, not user-visible foreign content. */
+export function listForeignTopLevel(cacheDir: string): string[] {
+  if (!fs.existsSync(cacheDir)) return [];
+  let topLevel: fs.Dirent[];
+  try {
+    topLevel = fs.readdirSync(cacheDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const foreign: string[] = [];
+  for (const top of topLevel) {
+    if (top.name === SENTINEL_NAME) continue;
+    const topPath = path.join(cacheDir, top.name);
+    let st: fs.Stats;
+    try { st = fs.lstatSync(topPath); } catch { continue; }
+    if (st.isDirectory()) {
+      if (BUCKET_NAME_RE.test(top.name)) continue; // recognised bucket
+      foreign.push(`${top.name}/`);
+    } else {
+      // Regular file or symlink at the top level: not part of the cache
+      // layout, so it's foreign. Don't follow symlinks.
+      foreign.push(top.name);
+    }
+  }
+  return foreign;
 }
 
 /** Recursive sum of regular file sizes under `dir`, plus the newest file
@@ -604,6 +653,27 @@ function runPrune(argv: string[]): number {
   const label = dryRun ? "Would delete:" : "Deleted:";
   // Pad label so the value column lines up with `cache stats` output.
   console.log(`${label.padEnd(13)} ${result.deleted} entries, ${formatSize(result.totalSize)}${dryRun ? "  (dry-run)" : ""}`);
+  // For `--all --dry-run`, the summary above is derived only from
+  // recognised cache entries — but the real `--all` recursively wipes
+  // the cache root, taking any foreign top-level files / directories
+  // with it. Surface those by name (and count) so the dry-run preview
+  // doesn't mislead the user about the true reclaim. We only enumerate
+  // top-level entries here (no recursion) — that's deliberate: the
+  // bucket-name guard in walkCache exists so `cache stats` doesn't
+  // appear to hang on a huge unrelated tree, and we must not reintroduce
+  // that cost just to get a more precise byte count.
+  if (dryRun && all) {
+    const foreign = listForeignTopLevel(cacheDir);
+    if (foreign.length > 0) {
+      const listing = foreign.slice(0, 10).join(", ");
+      const suffix = foreign.length > 10 ? ", ..." : "";
+      console.log(
+        `Would also wipe: ${foreign.length} foreign top-level entr${
+          foreign.length === 1 ? "y" : "ies"
+        } (--all removes the cache root): ${listing}${suffix}`,
+      );
+    }
+  }
   if (result.failed > 0) {
     console.error(`Error: ${result.failed} deletion(s) failed; cache is partially pruned`);
     return 1;

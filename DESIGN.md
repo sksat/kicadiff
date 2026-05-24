@@ -583,10 +583,22 @@ symlink は辿らない。`sumDir` も `lstat` ベースで symlink を一切カ
 `KICADIFF_CACHE_DIR` 配下の任意のサブツリー) には**一切 recurse しない**
 — totalSize には valid bucket subtree と top-level の foreign file
 のみを加算する。これにより `cache stats` が無関係な巨大ディレクトリを
-走査して hang したように見える事故を防ぐ。トレードオフとして、
-`cache prune --all` の実 reclaim 量は `stats` の "Total size" を
-上回る可能性がある (root を `rm -rf` するので foreign subtree も
-含めて消える)。
+走査して hang したように見える事故を防ぐ。同じ理屈で、valid な 2-hex
+bucket 配下に居る foreign directory (leaf 名が hex で無い、もしくは
+`combined.png` marker を持たない) も `sumDir` を呼ぶ前に弾く: leaf
+名検証と marker 存在チェックを recurse の**前に**実行するので、例えば
+`<root>/ab/some-non-hex-name/` のような誤った dir が居ても full
+recursive scan は走らない。トレードオフとして、`cache prune --all`
+の実 reclaim 量は `stats` の "Total size" を上回る可能性がある
+(root を `rm -rf` するので foreign subtree も含めて消える)。
+
+`cache prune --all --dry-run` はこの非対称性を緩和するため、
+recognised entries の "Would delete: N entries, X MiB" に加えて、
+top-level に居る foreign file / dir を**recurse せずに名前で列挙**
+する追加行 ("Would also wipe: M foreign top-level entries: ...") を
+出力する。バイト数は出さない (それを出すには foreign subtree を walk
+する必要があり、上記の hang ガードを台無しにする) が、"何が消えるか"
+は明示するので dry-run の意味が損なわれない。
 
 エントリ削除に失敗した場合 (`rmSync` が例外) は失敗を stderr に出力し、
 件数をカウントして `runCache` が non-zero で抜ける。`Deleted: N` の N
