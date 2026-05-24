@@ -237,13 +237,26 @@ export function extractNets(src: string): NetInfo {
   const padNets = new Map<string, string>();
   const componentRefs = new Set<string>();
 
-  // Top-level (net N "name") entries enumerate the project's net table.
-  // We only look at the outermost list (kicad_pcb) — nested (net ...) inside
-  // pads is membership, not declaration, and is picked up below.
+  // The (net ...) atom comes in two shapes:
+  //   - Legacy (KiCad <= 9): `(net <id> "<name>")` — name is at index 2.
+  //   - KiCad 10:            `(net "<name>")`      — name is at index 1.
+  // Read whichever is present so we cover both formats.
+  const netName = (atom: Sexp[]): string | undefined => {
+    if (typeof atom[2] === "string") return atom[2];
+    if (typeof atom[1] === "string") return atom[1];
+    return undefined;
+  };
+
+  // Top-level (net ...) entries enumerate the project's net table — but
+  // ONLY KiCad <= 9 emits them. KiCad 10 dropped the table entirely and
+  // we have to derive the name set from pad / track entries below.
+  // Nested (net ...) inside pads is membership, not declaration, and is
+  // picked up later.
   if (tree.length > 0 && Array.isArray(tree[0])) {
     for (const child of tree[0]) {
-      if (Array.isArray(child) && child[0] === "net" && typeof child[2] === "string") {
-        if (child[2] !== "") names.add(child[2]);
+      if (Array.isArray(child) && child[0] === "net") {
+        const name = netName(child);
+        if (name !== undefined && name !== "") names.add(name);
       }
     }
   }
@@ -256,10 +269,18 @@ export function extractNets(src: string): NetInfo {
       if (!Array.isArray(child) || child[0] !== "pad") continue;
       const padNum = typeof child[1] === "string" ? child[1] : "";
       if (!padNum) continue;
-      // Pad's (net id "name") sub-form. Absent for NC pads.
+      // Pad's (net ...) sub-form. Absent for NC pads. Same dual-shape
+      // handling as the top-level table — KiCad 10 pads have no id.
       const netSub = child.find(c => Array.isArray(c) && c[0] === "net");
-      if (Array.isArray(netSub) && typeof netSub[2] === "string" && netSub[2] !== "") {
-        padNets.set(`${ref}.${padNum}`, netSub[2]);
+      if (Array.isArray(netSub)) {
+        const name = netName(netSub);
+        if (name !== undefined && name !== "") {
+          padNets.set(`${ref}.${padNum}`, name);
+          // KiCad 10 has no top-level net table; backfill the name set
+          // from pad memberships so added/removed-net detection works.
+          // Harmless on legacy files — `Set.add` is idempotent.
+          names.add(name);
+        }
       }
     }
   });
@@ -289,9 +310,10 @@ export function diffNets(before: NetInfo, after: NetInfo): NetDiff {
     const b = before.padNets.get(key) ?? "";
     const a = after.padNets.get(key) ?? "";
     if (b === a) continue;
-    // Skip moves to/from the unconnected net — same rationale as excluding
-    // "" from `names`. A real rewire (named-net → named-net) survives.
-    if (b === "" || a === "") continue;
+    // We DO report named-net ↔ unconnected transitions: pulling a pad off
+    // GND or wiring an NC pad to +3V3 is a real electrical change worth
+    // surfacing. (We only suppress "" from the *name set* itself — see
+    // extractNets — because the unconnected net churns on every save.)
     padChanges.push({ pad: key, before: b, after: a });
   }
   padChanges.sort((x, y) => x.pad.localeCompare(y.pad, undefined, { numeric: true }));
@@ -456,7 +478,12 @@ export function textDiff(
     lines.push(`  Nets: +${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length}`);
     for (const n of nets.added) lines.push(`    + ${n}`);
     for (const n of nets.removed) lines.push(`    - ${n}`);
-    for (const p of nets.padChanges) lines.push(`    ~ ${p.pad}: ${p.before} → ${p.after}`);
+    // The unconnected net is named `""` in the file; render it as a word so
+    // a pad-disconnect line reads "GND → (unconnected)" instead of "GND → ".
+    const netLabel = (n: string) => n === "" ? "(unconnected)" : n;
+    for (const p of nets.padChanges) {
+      lines.push(`    ~ ${p.pad}: ${netLabel(p.before)} → ${netLabel(p.after)}`);
+    }
   }
   return lines.join("\n");
 }
@@ -518,8 +545,9 @@ export function markdownDiff(
     lines.push(`### Nets (+${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length})`);
     for (const n of nets.added) lines.push(`- \`+\` \`${n}\``);
     for (const n of nets.removed) lines.push(`- \`-\` \`${n}\``);
+    const netLabel = (n: string) => n === "" ? "(unconnected)" : n;
     for (const p of nets.padChanges) {
-      lines.push(`- \`~\` \`${p.pad}\` — \`${p.before}\` → \`${p.after}\``);
+      lines.push(`- \`~\` \`${p.pad}\` — \`${netLabel(p.before)}\` → \`${netLabel(p.after)}\``);
     }
   }
   return lines.join("\n");

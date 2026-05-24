@@ -17,8 +17,11 @@ file in your browser, or as a markdown report you can paste into a PR.
 - **Markdown report** (`--md`) with side-by-side image tables and a
   structural component diff (added / removed / changed by reference
   designator), plus — for PCBs — a `Nets` subsection that lists added /
-  removed nets and pads that were rewired (`R1.2: GND → /VCC`). Good for
-  PR descriptions and commit messages.
+  removed nets and pads that were rewired (`R1.2: GND → /VCC`). Pad
+  transitions to or from the unconnected net are surfaced too
+  (`R7.1: (unconnected) → +3V3`). Both legacy (`(net id "name")`) and
+  KiCad 10 (`(net "name")`, no top-level net table) shapes are
+  supported. Good for PR descriptions and commit messages.
 - **Text-only structural diff** (`--text-only`) — fast, no image
   rendering, prints to stdout. Includes the same `Nets` subsection for
   PCBs so routing changes show up in CI logs and grep:
@@ -26,9 +29,10 @@ file in your browser, or as a markdown report you can paste into a PR.
   ```
   blink.kicad_pcb (pcb): +0 -0 ~1 =3
     ~ R1  value: 330 → 470
-    Nets: +1 -0 ~1
+    Nets: +1 -0 ~2
       + /LED_OUT
       ~ R1.2: GND → /LED_OUT
+      ~ R7.1: (unconnected) → +3V3
   ```
 - **DRC / ERC violation diff** (`kicadiff check`) — runs design-rule and
   electrical-rule checks on both sides and reports the delta as

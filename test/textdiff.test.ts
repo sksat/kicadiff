@@ -19,7 +19,11 @@ const CLI = path.join(PROJECT_DIR, "kicadiff");
 
 /** Build a minimal valid-ish `.kicad_pcb` body with the given top-level
  *  net table and footprints. Just enough syntax for the textdiff parser
- *  (it only walks `(net ...)` and `(footprint ...)`). */
+ *  (it only walks `(net ...)` and `(footprint ...)`).
+ *
+ *  When `opts.kicad10` is set, emits the KiCad 10 shape: NO top-level net
+ *  table, and pad nets use `(net "name")` (no id). When unset, emits the
+ *  legacy `(net id "name")` shape with a top-level table. */
 function makePcb(
   nets: Array<{ id: number; name: string }>,
   footprints: Array<{
@@ -28,8 +32,15 @@ function makePcb(
     libId?: string;
     pads: Array<{ num: string; net: { id: number; name: string } | null }>;
   }>,
+  opts: { kicad10?: boolean } = {},
 ): string {
-  const netLines = nets.map(n => `\t(net ${n.id} "${n.name}")`).join("\n");
+  const k10 = !!opts.kicad10;
+  // KiCad 10 emits no top-level (net N "name") declarations — connectivity
+  // is inferred purely from pad / track entries. Reflect that here so the
+  // tests exercise the fallback path.
+  const netLines = k10
+    ? ""
+    : nets.map(n => `\t(net ${n.id} "${n.name}")`).join("\n");
   const fpLines = footprints.map((fp, fpi) => {
     const lib = fp.libId ?? "lib:R";
     const ref = fp.ref;
@@ -37,12 +48,18 @@ function makePcb(
     const uuid = `00000000-0000-0000-0000-${String(fpi).padStart(12, "0")}`;
     const padLines = fp.pads.map((p, pi) => {
       const padUuid = `11111111-1111-1111-${String(fpi).padStart(4, "0")}-${String(pi).padStart(12, "0")}`;
-      const netSexp = p.net ? `\n\t\t\t(net ${p.net.id} "${p.net.name}")` : "";
+      // KiCad 10 dropped the numeric id from the pad's net atom.
+      const netSexp = p.net
+        ? (k10
+          ? `\n\t\t\t(net "${p.net.name}")`
+          : `\n\t\t\t(net ${p.net.id} "${p.net.name}")`)
+        : "";
       return `\t\t(pad "${p.num}" smd rect\n\t\t\t(at 0 0)\n\t\t\t(size 1 1)\n\t\t\t(layers "F.Cu")${netSexp}\n\t\t\t(uuid "${padUuid}")\n\t\t)`;
     }).join("\n");
     return `\t(footprint "${lib}"\n\t\t(layer "F.Cu")\n\t\t(uuid "${uuid}")\n\t\t(at 100 100)\n\t\t(property "Reference" "${ref}"\n\t\t\t(at 0 -2 0)\n\t\t\t(layer "F.SilkS")\n\t\t\t(uuid "${uuid.replace(/0$/, "a")}")\n\t\t\t(effects (font (size 1 1)))\n\t\t)\n\t\t(property "Value" "${value}"\n\t\t\t(at 0 2 0)\n\t\t\t(layer "F.SilkS")\n\t\t\t(uuid "${uuid.replace(/0$/, "b")}")\n\t\t\t(effects (font (size 1 1)))\n\t\t)\n${padLines}\n\t)`;
   }).join("\n");
-  return `(kicad_pcb (version 20240108) (generator "test")\n${netLines}\n${fpLines}\n)\n`;
+  const version = k10 ? "20260206" : "20240108";
+  return `(kicad_pcb (version ${version}) (generator "test")\n${netLines}\n${fpLines}\n)\n`;
 }
 
 /** Create a temp file containing `body` and return its path. Cleanup is the
@@ -175,7 +192,11 @@ test.describe("diffNets", () => {
     expect(padChange?.after).toBe("VCC");
   });
 
-  test("ignores pad churn on the unconnected net", () => {
+  test("reports pad transitions to/from the unconnected net as real changes", () => {
+    // Pulling a pad off GND or attaching an NC pad to VCC is an electrical
+    // change worth surfacing. Only the *name set* filters out "" (because
+    // the unconnected "net" itself churns constantly); pad-level changes
+    // involving it must still appear.
     const before = extractNets(makePcb(
       [{ id: 0, name: "" }, { id: 1, name: "VCC" }],
       [{
@@ -195,13 +216,14 @@ test.describe("diffNets", () => {
       }],
     ));
     const d = diffNets(before, after);
-    // Moving a pad from "" → VCC counts (gaining a real connection); but moves
-    // *to* "" are silently dropped (unconnected churn). Either way nothing
-    // involving the empty net name should appear as a named-net entry.
-    for (const p of d.padChanges) {
-      expect(p.before).not.toBe("");
-      expect(p.after).not.toBe("");
-    }
+    const r1_1 = d.padChanges.find(p => p.pad === "R1.1");
+    const r1_2 = d.padChanges.find(p => p.pad === "R1.2");
+    expect(r1_1).toMatchObject({ before: "VCC", after: "" });
+    expect(r1_2).toMatchObject({ before: "", after: "VCC" });
+    // The empty name itself must NOT appear in the added/removed net list —
+    // only the *name set* filter survives.
+    expect(d.added).not.toContain("");
+    expect(d.removed).not.toContain("");
   });
 
   test("pads on an added/removed footprint are not reported individually", () => {
@@ -374,6 +396,199 @@ test.describe("textDiff with nets", () => {
     const { text } = diffPcbBodies(before, after);
     expect(text).toMatch(/\+ R2/);     // footprint-level
     expect(text).not.toMatch(/R2\.1/); // no individual pad line for it
+  });
+});
+
+// =============================================================================
+// KiCad 10 net atom shape: `(net "name")` (no numeric id) + no top-level
+// net table. The fixture `examples/mcu-board/mcu-board.kicad_pcb` uses this
+// shape; the legacy `(net id "name")` parser silently misses it.
+// =============================================================================
+
+test.describe("KiCad 10 net atom shape", () => {
+  test("extractNets derives the name set from pad nets when no top-level table exists", () => {
+    const src = makePcb(
+      [{ id: 1, name: "VCC" }, { id: 2, name: "GND" }],
+      [{
+        ref: "R1", pads: [
+          { num: "1", net: { id: 1, name: "VCC" } },
+          { num: "2", net: { id: 2, name: "GND" } },
+        ],
+      }],
+      { kicad10: true },
+    );
+    const info = extractNets(src);
+    expect(info.names.has("VCC")).toBe(true);
+    expect(info.names.has("GND")).toBe(true);
+    expect(info.padNets.get("R1.1")).toBe("VCC");
+    expect(info.padNets.get("R1.2")).toBe("GND");
+  });
+
+  test("extractNets reads pad net name when atom is `(net \"name\")` (KiCad 10)", () => {
+    // Minimal hand-rolled fixture: no top-level table, single footprint
+    // with the modern pad-net shape.
+    const src = `(kicad_pcb (version 20260206) (generator "pcbnew")
+\t(footprint "lib:R"
+\t\t(layer "F.Cu")
+\t\t(uuid "11111111-1111-1111-1111-111111111111")
+\t\t(at 0 0)
+\t\t(property "Reference" "R7"
+\t\t\t(at 0 -2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "22222222-2222-2222-2222-222222222222")
+\t\t)
+\t\t(property "Value" "10k"
+\t\t\t(at 0 2 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "33333333-3333-3333-3333-333333333333")
+\t\t)
+\t\t(pad "1" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net "+3V3")
+\t\t\t(uuid "44444444-4444-4444-4444-444444444444")
+\t\t)
+\t)
+)
+`;
+    const info = extractNets(src);
+    expect(info.padNets.get("R7.1")).toBe("+3V3");
+    expect(info.names.has("+3V3")).toBe(true);
+  });
+
+  test("net diff catches a pad-rewire on a KiCad 10 fixture", () => {
+    const before = makePcb(
+      [{ id: 1, name: "+3V3" }, { id: 2, name: "GND" }],
+      [{
+        ref: "R1", pads: [
+          { num: "1", net: { id: 1, name: "+3V3" } },
+          { num: "2", net: { id: 2, name: "GND" } },
+        ],
+      }],
+      { kicad10: true },
+    );
+    const after = makePcb(
+      [{ id: 1, name: "+3V3" }, { id: 2, name: "GND" }, { id: 3, name: "/LED" }],
+      [{
+        ref: "R1", pads: [
+          { num: "1", net: { id: 1, name: "+3V3" } },
+          { num: "2", net: { id: 3, name: "/LED" } },
+        ],
+      }],
+      { kicad10: true },
+    );
+    const { text } = diffPcbBodies(before, after);
+    expect(text).toMatch(/Nets:/);
+    expect(text).toMatch(/\+ \/LED/);
+    expect(text).toMatch(/- GND/);
+    expect(text).toMatch(/R1\.2.*GND.*→.*\/LED/);
+  });
+
+  test("real mcu-board fixture: pad rewire is surfaced", () => {
+    // Smoke test against the actual KiCad 10 fixture shipped with the repo.
+    // Without KiCad-10 atom support, extractNets returns empty sets and this
+    // edit goes completely silent.
+    const fixtureSrc = fs.readFileSync(
+      path.join(PROJECT_DIR, "examples/mcu-board/mcu-board.kicad_pcb"),
+      "utf8",
+    );
+    // Sanity-check the fixture really uses the modern shape (no `(net N "x")`).
+    expect(fixtureSrc).toMatch(/\(net "GND"\)/);
+
+    // Rewire the first pad currently on "GND" to "+3V3". This is text-level
+    // surgery so we don't have to invoke kicad-cli.
+    const edited = fixtureSrc.replace(/\(net "GND"\)/, '(net "+3V3")');
+    expect(edited).not.toBe(fixtureSrc);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-mcu-net-"));
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+      const pcbPath = path.join(dir, "mcu-board.kicad_pcb");
+      fs.writeFileSync(pcbPath, fixtureSrc);
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "add", "."], { cwd: dir });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+        "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: dir });
+      fs.writeFileSync(pcbPath, edited);
+      const text = textDiff(pcbPath, "HEAD", "", dir);
+      expect(text).toMatch(/Nets:/);
+      // The pad whose net string we changed should appear in the pad-change list.
+      expect(text).toMatch(/GND.*→.*\+3V3/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// =============================================================================
+// Pad transitions into/out of the unconnected net are real electrical
+// changes; only the *named* unconnected net "" is filtered from the name
+// set, never the pad-change lines themselves.
+// =============================================================================
+
+test.describe("pad ↔ unconnected transitions", () => {
+  test("pad disconnected from a named net (GND → unconnected) is reported", () => {
+    const before = extractNets(makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "GND" }],
+      [{ ref: "R1", pads: [{ num: "2", net: { id: 1, name: "GND" } }] }],
+    ));
+    const after = extractNets(makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "GND" }],
+      [{ ref: "R1", pads: [{ num: "2", net: { id: 0, name: "" } }] }],
+    ));
+    const d = diffNets(before, after);
+    const change = d.padChanges.find(p => p.pad === "R1.2");
+    expect(change).toBeDefined();
+    expect(change?.before).toBe("GND");
+    expect(change?.after).toBe("");
+  });
+
+  test("pad newly connected to a named net (unconnected → +3V3) is reported", () => {
+    const before = extractNets(makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "+3V3" }],
+      [{ ref: "R7", pads: [{ num: "1", net: { id: 0, name: "" } }] }],
+    ));
+    const after = extractNets(makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "+3V3" }],
+      [{ ref: "R7", pads: [{ num: "1", net: { id: 1, name: "+3V3" } }] }],
+    ));
+    const d = diffNets(before, after);
+    const change = d.padChanges.find(p => p.pad === "R7.1");
+    expect(change).toBeDefined();
+    expect(change?.before).toBe("");
+    expect(change?.after).toBe("+3V3");
+  });
+
+  test("named ↔ named rewire still works (regression for the existing behavior)", () => {
+    const before = extractNets(makePcb(
+      [{ id: 1, name: "VCC" }, { id: 2, name: "GND" }],
+      [{ ref: "R1", pads: [{ num: "2", net: { id: 2, name: "GND" } }] }],
+    ));
+    const after = extractNets(makePcb(
+      [{ id: 1, name: "VCC" }, { id: 2, name: "GND" }],
+      [{ ref: "R1", pads: [{ num: "2", net: { id: 1, name: "VCC" } }] }],
+    ));
+    const d = diffNets(before, after);
+    expect(d.padChanges).toHaveLength(1);
+    expect(d.padChanges[0]).toMatchObject({ pad: "R1.2", before: "GND", after: "VCC" });
+  });
+
+  test("name set still excludes \"\" even when present as a pad net", () => {
+    const info = extractNets(makePcb(
+      [{ id: 0, name: "" }, { id: 1, name: "VCC" }],
+      [{
+        ref: "R1", pads: [
+          { num: "1", net: { id: 1, name: "VCC" } },
+          { num: "2", net: { id: 0, name: "" } },
+        ],
+      }],
+      // KiCad 10 path — name set must be derived from pad nets, and "" must
+      // still be filtered out so it doesn't appear as a fake added/removed net.
+      { kicad10: true },
+    ));
+    expect(info.names.has("")).toBe(false);
+    expect(info.names.has("VCC")).toBe(true);
   });
 });
 

@@ -136,9 +136,25 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
 `(net ...)` membership を読み、`Nets` サブセクション (markdown 版は
 `### Nets`) として「追加 / 削除されたネット」と「pad の接続先が
 変わったケース (`R1.2: GND → /LED_OUT`)」を出力する。Net の identity は
-**名前** で持つ — id は保存ごとに振り直されるため安定しない。`""`
-(unconnected) は除外 (unrouted pad の churn で diff が埋まるのを
-防ぐ)。footprint 自体が added / removed のときは、その footprint の
+**名前** で持つ — id は保存ごとに振り直されるため安定しない。
+
+(net ...) atom の形は KiCad のバージョンで 2 種ある:
+
+- レガシー (KiCad <= 9): `(net <id> "<name>")` — 名前は index 2、
+  さらにトップレベルに `(net N "name")` 表を持つ。
+- KiCad 10: `(net "<name>")` — 名前は index 1、トップレベルの
+  net 表は消えた。
+
+両方サポートする。トップレベル表が無い場合は、pad の `(net ...)`
+membership から名前集合を逆算する (`examples/mcu-board` がこの経路)。
+
+`""` (unconnected) は **名前集合からのみ** 除外する (unrouted pad の
+churn で diff が埋まるのを防ぐ)。一方で pad 単位の変更行では
+named ↔ unconnected の遷移も「実電気的変更」として残す — GND から
+pad を外したり NC pad に +3V3 を繋いだのは PR で見たい情報なので、
+`R7.1: (unconnected) → +3V3` のように表示する。
+
+footprint 自体が added / removed のときは、その footprint の
 pad 変更行は `Nets` サブセクションから抑制する (footprint レベルの
 行で代替済)。トップ行の `+A -R ~C =U` summary は component 専用の
 ままにしてあるので、既存の summary を grep / parse している hook 等
