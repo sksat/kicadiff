@@ -142,8 +142,10 @@ export interface WalkResult {
  *  walk outside it.
  *
  *  Side-effect: drops the `.kicadiff-cache` sentinel if missing, so
- *  pre-sentinel caches auto-upgrade on next read. */
-export function walkCache(cacheDir: string): WalkResult {
+ *  pre-sentinel caches auto-upgrade on next read. Pass `readOnly: true`
+ *  to suppress the write — required for `cache prune --dry-run`, whose
+ *  contract is "change nothing on disk". */
+export function walkCache(cacheDir: string, options: { readOnly?: boolean } = {}): WalkResult {
   if (!fs.existsSync(cacheDir)) return { entries: [], totalSize: 0 };
   const entries: CacheEntry[] = [];
   let totalSize = 0;
@@ -223,7 +225,7 @@ export function walkCache(cacheDir: string): WalkResult {
   // marker makes future `cache prune --all` runs work without a manual
   // step. If there were zero leaves we leave the dir alone so the
   // safety guard can still refuse an unrelated directory.
-  if (entries.length > 0) ensureSentinel(cacheDir);
+  if (entries.length > 0 && !options.readOnly) ensureSentinel(cacheDir);
   return { entries, totalSize };
 }
 
@@ -429,7 +431,10 @@ function pruneEntries(
   cacheDir: string,
   options: PruneOptions,
 ): PruneResult {
-  const { entries } = walkCache(cacheDir);
+  // Honour dry-run's "change nothing on disk" contract: walkCache normally
+  // auto-installs the sentinel as a transparent upgrade for pre-sentinel
+  // caches, but in dry-run we must not.
+  const { entries } = walkCache(cacheDir, { readOnly: options.dryRun });
   const now = Date.now();
   const targets = entries.filter((e) => {
     if (options.selector.kind === "all") return true;

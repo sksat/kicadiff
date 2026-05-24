@@ -130,6 +130,24 @@ test.describe("cache prune", () => {
     expect(fs.existsSync(newLeaf)).toBe(true);
   });
 
+  test("--dry-run does not write the sentinel as a side effect", () => {
+    // `walkCache` auto-installs `.kicadiff-cache` on first read so
+    // pre-sentinel caches upgrade transparently. `cache prune --dry-run`
+    // is documented as "change nothing on disk", so it must NOT trigger
+    // the sentinel write either — otherwise dry-run violates its own
+    // contract.
+    const now = Date.now();
+    makeEntry(cacheDir, "ccccccccccc", 1024, now);
+    fs.rmSync(path.join(cacheDir, ".kicadiff-cache"), { force: true });
+    expect(fs.existsSync(path.join(cacheDir, ".kicadiff-cache"))).toBe(false);
+
+    const r = runCli(["cache", "prune", "--older-than", "1d", "--dry-run"], {
+      env: envWith(),
+    });
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(path.join(cacheDir, ".kicadiff-cache"))).toBe(false);
+  });
+
   test("--older-than X deletes only entries older than the cutoff", () => {
     const now = Date.now();
     const day = 24 * 60 * 60 * 1000;
