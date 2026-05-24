@@ -188,4 +188,94 @@ test.describe("cache prune", () => {
     expect(fs.existsSync(path.join(cacheDir, "aa"))).toBe(false);
     expect(fs.existsSync(path.join(cacheDir, "bb"))).toBe(true);
   });
+
+  test("--all wipes foreign files at the cache root too", () => {
+    // A real user (or a botched earlier run) may drop unexpected files
+    // directly under the cache root. `--all` advertises wiping the entire
+    // cache, so anything sitting at the root must go with it.
+    const now = Date.now();
+    makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+    const stray = path.join(cacheDir, "README");
+    fs.writeFileSync(stray, "left over from something");
+    const strayDir = path.join(cacheDir, "not-a-bucket");
+    fs.mkdirSync(strayDir, { recursive: true });
+    fs.writeFileSync(path.join(strayDir, "x"), "x");
+
+    const r = runCli(["cache", "prune", "--all", "--yes"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(stray)).toBe(false);
+    expect(fs.existsSync(strayDir)).toBe(false);
+    expect(fs.existsSync(cacheDir)).toBe(false);
+  });
+});
+
+test.describe("cache stats — traversal safety", () => {
+  test("symlinked bucket is not followed", () => {
+    // Set up an "outside" directory containing a (fake) huge entry. If
+    // walkCache follows the symlink it would inflate both the entry count
+    // and the reported total size.
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-outside-"));
+    try {
+      // 1 MiB file under a bogus "bucket/leaf" structure outside the cache
+      const outLeaf = path.join(outside, "aa", "deadbeef");
+      fs.mkdirSync(outLeaf, { recursive: true });
+      fs.writeFileSync(path.join(outLeaf, "combined.png"), Buffer.alloc(1024 * 1024, 0));
+
+      // A real, small entry inside the cache for baseline reporting
+      const now = Date.now();
+      makeEntry(cacheDir, "bb11111111", 100, now);
+
+      // Symlink the bogus bucket into the real cache dir under a hex name
+      // so name validation alone wouldn't reject it.
+      fs.symlinkSync(path.join(outside, "aa"), path.join(cacheDir, "cc"));
+
+      const r = runCli(["cache", "stats"], { env: envWith() });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Entries:\s+1\b/);
+      // 1 MiB lives behind the symlink; the report must not include it.
+      expect(r.stdout).not.toMatch(/Total size:\s+[\d.]+\s*MiB/);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("non-hex bucket and leaf names are ignored", () => {
+    // The cache writer only emits two-char hex bucket names and hex leaf
+    // names. Anything else is foreign and must not be traversed or counted
+    // as an entry.
+    const now = Date.now();
+    makeEntry(cacheDir, "aa11111111", 100, now);
+
+    // Foreign bucket-level directory (not 2-hex)
+    const foreignBucket = path.join(cacheDir, "tmp");
+    fs.mkdirSync(path.join(foreignBucket, "anything"), { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignBucket, "anything", "combined.png"),
+      Buffer.alloc(2048, 0),
+    );
+
+    // Foreign leaf inside a valid bucket (leaf has non-hex chars)
+    const validBucket = path.join(cacheDir, "bb");
+    const foreignLeaf = path.join(validBucket, "NOT-HEX-NAME");
+    fs.mkdirSync(foreignLeaf, { recursive: true });
+    fs.writeFileSync(path.join(foreignLeaf, "combined.png"), Buffer.alloc(2048, 0));
+
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Entries:\s+1\b/);
+  });
+});
+
+test.describe("cache prune --help", () => {
+  test("help text describes --yes behaviour accurately", () => {
+    const r = runCli(["cache", "prune", "--help"]);
+    expect(r.status).toBe(0);
+    // The previous wording claimed --all "always requires explicit
+    // confirmation interactively", which contradicted the --yes flag
+    // that intentionally skips the prompt. The corrected wording must
+    // call out that --yes skips the prompt and is required in non-TTY.
+    expect(r.stdout.toLowerCase()).toContain("--yes");
+    expect(r.stdout).not.toMatch(/Always requires explicit confirmation interactively/);
+    expect(r.stdout.toLowerCase()).toMatch(/non-tty/);
+  });
 });

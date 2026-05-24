@@ -14,7 +14,9 @@
  * "Entry" here means a leaf directory containing at least `combined.png` —
  * the rest of the files in a leaf belong to the same cached render. Sizes
  * are summed over every regular file under the root, including the two-char
- * bucket dirs themselves, so the reported total matches `du -sb <root>`.
+ * bucket dirs themselves. Symlinks are skipped (never followed), so the
+ * total reflects bytes physically stored under the cache root — close to
+ * `du -sb <root>` but never inflated by a link pointing elsewhere.
  */
 
 import * as fs from "node:fs";
@@ -43,10 +45,25 @@ export function getCacheDir(): string {
   return path.join(base, "kicadiff");
 }
 
+/** Bucket directory names produced by the cache writer: exactly two
+ *  lowercase hex chars (`hash[0:2]`). Anything else under the cache root
+ *  is foreign — possibly a symlink someone dropped in, a `.tmp` from a
+ *  crashed run, or just a stray file — and we refuse to traverse it so
+ *  `cache stats` / `cache prune` can never escape the intended layout. */
+const BUCKET_NAME_RE = /^[0-9a-f]{2}$/;
+/** Leaf directory names produced by the cache writer: the remaining hex
+ *  tail of the hash (`hash[2:]`). Same rationale as BUCKET_NAME_RE. */
+const LEAF_NAME_RE = /^[0-9a-f]+$/;
+
 /** Walk the cache and return one CacheEntry per leaf directory. A "leaf"
  *  is any `<bucket>/<rest>/` dir that contains a `combined.png` — that's
  *  the marker render.ts uses for a cache hit, so anything without it is
- *  either incomplete or not ours and we leave it alone. */
+ *  either incomplete or not ours and we leave it alone.
+ *
+ *  Traversal is hardened against escape: bucket/leaf names must match
+ *  the hex shape the cache writer emits, and each directory check uses
+ *  `lstatSync` so a symlink under the cache root can't redirect the
+ *  walk outside it. */
 export function walkCache(cacheDir: string): CacheEntry[] {
   if (!fs.existsSync(cacheDir)) return [];
   const out: CacheEntry[] = [];
@@ -57,19 +74,27 @@ export function walkCache(cacheDir: string): CacheEntry[] {
     return out;
   }
   for (const bucket of buckets) {
+    if (!BUCKET_NAME_RE.test(bucket)) continue;
     const bucketPath = path.join(cacheDir, bucket);
     let bs: fs.Stats;
-    try { bs = fs.statSync(bucketPath); } catch { continue; }
-    if (!bs.isDirectory()) continue;
+    try { bs = fs.lstatSync(bucketPath); } catch { continue; }
+    // Skip symlinks even if they point at a real dir — following them
+    // could traverse outside the cache root (huge or unrelated trees).
+    if (bs.isSymbolicLink() || !bs.isDirectory()) continue;
     let leaves: string[];
     try { leaves = fs.readdirSync(bucketPath); } catch { continue; }
     for (const leaf of leaves) {
+      if (!LEAF_NAME_RE.test(leaf)) continue;
       const leafPath = path.join(bucketPath, leaf);
       let ls: fs.Stats;
-      try { ls = fs.statSync(leafPath); } catch { continue; }
-      if (!ls.isDirectory()) continue;
+      try { ls = fs.lstatSync(leafPath); } catch { continue; }
+      if (ls.isSymbolicLink() || !ls.isDirectory()) continue;
       const marker = path.join(leafPath, "combined.png");
-      if (!fs.existsSync(marker)) continue;
+      // Marker existence: lstat so a symlinked combined.png doesn't trick
+      // the walker into treating the leaf as a real entry.
+      let markerSt: fs.Stats;
+      try { markerSt = fs.lstatSync(marker); } catch { continue; }
+      if (!markerSt.isFile()) continue;
       const { size, newest } = sumDir(leafPath);
       out.push({
         path: leafPath,
@@ -82,7 +107,12 @@ export function walkCache(cacheDir: string): CacheEntry[] {
 }
 
 /** Recursive sum of regular file sizes under `dir`, plus the newest file
- *  mtime seen. Symlinks are not followed (lstat). */
+ *  mtime seen. Uses `lstatSync` throughout: symlinks (file or dir) are
+ *  skipped entirely — their target sizes are NOT counted. This matches
+ *  `du -sb` minus link targets (i.e. `du -sb` without `-L`, where symlink
+ *  sizes themselves are 0 in our accounting). The intent is filesystem-
+ *  content-only reporting so a self-referential or external symlink can
+ *  never inflate the total. */
 function sumDir(dir: string): { size: number; newest: number } {
   let size = 0;
   let newest = 0;
@@ -94,24 +124,25 @@ function sumDir(dir: string): { size: number; newest: number } {
   }
   for (const ent of entries) {
     const full = path.join(dir, ent.name);
-    if (ent.isDirectory()) {
+    let st: fs.Stats;
+    try { st = fs.lstatSync(full); } catch { continue; }
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
       const sub = sumDir(full);
       size += sub.size;
       if (sub.newest > newest) newest = sub.newest;
-    } else if (ent.isFile()) {
-      try {
-        const st = fs.statSync(full);
-        size += st.size;
-        if (st.mtimeMs > newest) newest = st.mtimeMs;
-      } catch { /* ignore */ }
+    } else if (st.isFile()) {
+      size += st.size;
+      if (st.mtimeMs > newest) newest = st.mtimeMs;
     }
   }
   return { size, newest };
 }
 
 /** Sum of every regular file under the cache root (including bucket dirs,
- *  not just leaves). Matches what `du` would report — useful when the
- *  caller wants the on-disk footprint, not just the prunable footprint. */
+ *  not just leaves). Symlinks are skipped (see sumDir), so the figure is
+ *  the on-disk footprint of files that physically live inside the cache —
+ *  close to `du -sb` but never inflated by links pointing elsewhere. */
 function totalCacheSize(cacheDir: string): number {
   if (!fs.existsSync(cacheDir)) return 0;
   return sumDir(cacheDir).size;
@@ -215,15 +246,32 @@ interface PruneOptions {
   dryRun: boolean;
 }
 
+interface PruneResult {
+  /** Number of entries actually removed (or, in dry-run, that would be). */
+  deleted: number;
+  /** Total bytes removed (sum of `size` over deleted entries). */
+  totalSize: number;
+  /** Targets selected for deletion (returned for caller-side reporting). */
+  targets: CacheEntry[];
+  /** Number of deletions that failed (rmSync threw). The caller surfaces
+   *  this as a non-zero exit code so CI can flag a partial cleanup. */
+  failed: number;
+}
+
 /** Identify the entries to delete, then delete them (or report them, in
  *  dry-run). Returns the counts so the caller can print a uniform summary
  *  line. After deleting leaves we also rmdir any bucket dir that's empty
  *  — the two-level layout is an internal implementation detail and should
- *  not leak empty 2-char dirs into the user's view. */
+ *  not leak empty 2-char dirs into the user's view.
+ *
+ *  For `--all`, after per-entry deletion succeeds we recursively remove
+ *  the cache root itself so foreign files (a stray README, a `.tmp` from
+ *  a crashed run) are wiped along with the registered entries — that's
+ *  what the flag advertises. */
 function pruneEntries(
   cacheDir: string,
   options: PruneOptions,
-): { deleted: number; totalSize: number; targets: CacheEntry[] } {
+): PruneResult {
   const entries = walkCache(cacheDir);
   const now = Date.now();
   const targets = entries.filter((e) => {
@@ -232,14 +280,22 @@ function pruneEntries(
   });
   const totalSize = targets.reduce((acc, e) => acc + e.size, 0);
   if (options.dryRun) {
-    return { deleted: targets.length, totalSize, targets };
+    return { deleted: targets.length, totalSize, targets, failed: 0 };
   }
+  let deleted = 0;
+  let failed = 0;
   const touchedBuckets = new Set<string>();
   for (const t of targets) {
     try {
       fs.rmSync(t.path, { recursive: true, force: true });
+      deleted++;
       touchedBuckets.add(path.dirname(t.path));
-    } catch { /* best-effort: skip and continue */ }
+    } catch (e) {
+      // Surface the failure so it shows up in CI logs — silently swallowing
+      // here is how the original "Deleted: N" line ended up lying.
+      console.error(`Error: failed to delete ${t.path}: ${(e as Error).message}`);
+      failed++;
+    }
   }
   // Remove now-empty bucket dirs so the layout stays tidy. rmdir refuses
   // non-empty dirs, which is exactly what we want.
@@ -249,15 +305,21 @@ function pruneEntries(
       if (remaining.length === 0) fs.rmdirSync(b);
     } catch { /* ignore */ }
   }
-  // If --all and the cache root is now empty, remove it too: `cache stats`
-  // will then report "(empty)" cleanly without any leftover bucket detritus.
-  if (options.selector.kind === "all") {
+  // --all advertises wiping the whole cache: blow away the root recursively
+  // so foreign files at the top level (a leftover README, partial entries
+  // that didn't have a combined.png, anything with a non-hex name we
+  // refused to walk into) go too. Only do this when no per-entry deletion
+  // failed; otherwise we'd be hiding the failure by deleting everything
+  // around the offending path.
+  if (options.selector.kind === "all" && failed === 0) {
     try {
-      const remaining = fs.readdirSync(cacheDir);
-      if (remaining.length === 0) fs.rmdirSync(cacheDir);
-    } catch { /* ignore */ }
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+    } catch (e) {
+      console.error(`Error: failed to remove cache root ${cacheDir}: ${(e as Error).message}`);
+      failed++;
+    }
   }
-  return { deleted: targets.length, totalSize, targets };
+  return { deleted, totalSize, targets, failed };
 }
 
 function pruneHelp(): void {
@@ -276,11 +338,14 @@ Subcommands:
     --older-than D   Delete entries whose mtime is older than D. D is
                      <number><unit> with unit s/m/h/d (e.g. 30d, 12h, 45m).
                      The unit is required.
-    --all            Delete every cache entry. Requires --yes when stdin
-                     is not a TTY (so CI doesn't hang on the prompt). Always
-                     requires explicit confirmation interactively.
+    --all            Delete every cache entry AND the cache root itself
+                     (so any foreign files dropped under the root are also
+                     wiped). Confirmation prompt unless --yes is provided;
+                     --yes is required in non-TTY environments (CI) so the
+                     prompt can't hang a build.
     --dry-run        Print what would be deleted, change nothing on disk.
-    --yes, -y        Skip the confirmation prompt for --all.
+    --yes, -y        Skip the confirmation prompt for --all (required in
+                     non-TTY environments).
 
 Env:
   KICADIFF_CACHE_DIR   Override the cache directory (default:
@@ -413,5 +478,9 @@ function runPrune(argv: string[]): number {
   const label = dryRun ? "Would delete:" : "Deleted:";
   // Pad label so the value column lines up with `cache stats` output.
   console.log(`${label.padEnd(13)} ${result.deleted} entries, ${formatSize(result.totalSize)}${dryRun ? "  (dry-run)" : ""}`);
+  if (result.failed > 0) {
+    console.error(`Error: ${result.failed} deletion(s) failed; cache is partially pruned`);
+    return 1;
+  }
   return 0;
 }

@@ -197,8 +197,10 @@ kicadiff cache stats
 kicadiff cache prune --older-than 30d
 kicadiff cache prune --older-than 30d --dry-run    # preview, change nothing
 
-# Wipe the whole cache. `--yes` is required in non-TTY (CI) environments
-# so the prompt can never hang a build.
+# Wipe the whole cache (recursive rm of the cache root — any stray files
+# at the root go too, not just registered entries). `--yes` skips the
+# confirmation prompt and is required in non-TTY (CI) environments so
+# the prompt can never hang a build.
 kicadiff cache prune --all --yes
 ```
 

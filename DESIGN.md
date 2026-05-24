@@ -550,5 +550,17 @@ cache miss 時はレンダリング → 結果をキャッシュへ書き戻す 
 依存せず、`getCacheDir()` だけ render.ts と同じロジックを duplicate
 している (依存方向を CLI → cache → render の順に固定するため)。
 leaf を削除した後、空になった bucket dir (`<hash[0:2]>/`) も rmdir
-する。`--all` 後はキャッシュ root 自体も rmdir し、`cache stats` が
-clean な `(empty)` メッセージを返す状態にする。
+する。`--all` はキャッシュ root を `rm -rf` で丸ごと消す: bucket/leaf
+の hex 名検証で walk が無視した foreign file (`README` 等) も含めて
+"すべて" 消すことを保証する (advertised behaviour に一致させる)。
+
+walk 自体も traversal escape に対して防御してある: bucket 名は厳密に
+2 桁 hex、leaf 名は hex のみを許可し、bucket / leaf の `lstat` を見て
+symlink は辿らない。`sumDir` も `lstat` ベースで symlink を一切カウント
+しないので、`cache stats` のサイズは「実体としてキャッシュ root 配下に
+ある bytes」だけを表す (link の指す先まで含めて膨らむことはない)。
+
+エントリ削除に失敗した場合 (`rmSync` が例外) は失敗を stderr に出力し、
+件数をカウントして `runCache` が non-zero で抜ける。`Deleted: N` の N
+は実際に消えた件数だけを示す。`--all` の root rmdir は per-entry 削除が
+全成功したときに限り実行する (一部失敗時にエラーを覆い隠さないため)。
