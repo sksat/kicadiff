@@ -149,12 +149,14 @@ export function walkCache(cacheDir: string, options: { readOnly?: boolean } = {}
   if (!fs.existsSync(cacheDir)) return { entries: [], totalSize: 0 };
   const entries: CacheEntry[] = [];
   let totalSize = 0;
-  let topLevel: fs.Dirent[];
-  try {
-    topLevel = fs.readdirSync(cacheDir, { withFileTypes: true });
-  } catch {
-    return { entries, totalSize };
-  }
+  // The existsSync guard at the top of the function handles the common
+  // "no cache yet" (ENOENT) case. If readdirSync fails after that, it's
+  // a real problem (EACCES on a locked-down dir, ENOTDIR on a path
+  // collision) and silently returning empty would let `cache stats`
+  // report "(empty)" and `cache prune` say "Deleted: 0" — hiding the
+  // permission issue. Let it throw; the CLI wrapper turns it into a
+  // non-zero exit with the underlying message.
+  const topLevel: fs.Dirent[] = fs.readdirSync(cacheDir, { withFileTypes: true });
   for (const top of topLevel) {
     const topPath = path.join(cacheDir, top.name);
     let topSt: fs.Stats;
@@ -187,12 +189,12 @@ export function walkCache(cacheDir: string, options: { readOnly?: boolean } = {}
       let ls: fs.Stats;
       try { ls = fs.lstatSync(leafPath); } catch { continue; }
       if (ls.isSymbolicLink()) continue;
-      // Sum the bytes regardless of whether the name validates — they
-      // sit under the cache root and contribute to disk usage.
-      if (ls.isFile()) {
-        totalSize += ls.size;
-        continue;
-      }
+      // Files directly under a bucket dir are foreign: the cache writer
+      // only ever produces leaf *directories* here. Treat them like
+      // foreign top-level dirs and foreign leaf dirs — skip without
+      // counting. `cache prune --all` will still wipe them via the
+      // recursive root rm; `stats` just under-reports them by design,
+      // matching the documented "recognised cache content only" contract.
       if (!ls.isDirectory()) continue;
       // Validate the leaf name AND the combined.png marker BEFORE
       // recursing with sumDir. The previous order called sumDir first,
@@ -628,9 +630,18 @@ function runPrune(argv: string[]): number {
     // do without first having to mark the directory.
     if (!dryRun) {
       const sentinel = path.join(cacheDir, SENTINEL_NAME);
-      if (!fs.existsSync(sentinel)) {
+      // lstat (not existsSync): a symlinked marker pointing anywhere
+      // mustn't satisfy the guard, otherwise an attacker / a
+      // misconfigured run could bypass the safety net by dropping a
+      // dangling symlink into the target directory.
+      let sentinelOk = false;
+      try {
+        const st = fs.lstatSync(sentinel);
+        sentinelOk = st.isFile();
+      } catch { /* missing → not ok */ }
+      if (!sentinelOk) {
         console.error(
-          `Error: refusing to recursively delete ${cacheDir} — it has no ${SENTINEL_NAME} marker.`,
+          `Error: refusing to recursively delete ${cacheDir} — it has no ${SENTINEL_NAME} marker (or the marker is not a regular file).`,
         );
         console.error(
           "This guard exists so a misconfigured KICADIFF_CACHE_DIR can't silently wipe an unrelated directory.",

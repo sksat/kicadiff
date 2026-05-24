@@ -380,6 +380,29 @@ test.describe("cache stats — traversal safety", () => {
   });
 });
 
+test.describe("cache stats — bucket-level files", () => {
+  // A bucket dir (`<root>/<2-hex>/`) is documented to contain only leaf
+  // dirs; a file dropped directly under a bucket is foreign and follows
+  // the same "skip foreign content, don't pretend to measure it" rule
+  // already applied to foreign top-level dirs and foreign leaf dirs.
+  // Without this, stats over-reports vs. the documented contract.
+  test("regular files directly inside a valid bucket are NOT counted", () => {
+    // Need at least one valid leaf so printStats doesn't short-circuit
+    // to "(empty)" — only then does the Total-size line appear.
+    const now = Date.now();
+    makeEntry(cacheDir, "abdeadbeef", 100, now); // 100-byte leaf under "ab/"
+    // 4 MiB foreign file at the bucket level (sibling of the valid leaf
+    // dir, not inside it).
+    fs.writeFileSync(path.join(cacheDir, "ab", "stray-data"), Buffer.alloc(4 * 1024 * 1024));
+
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    // Must not appear as MiB-sized in the report (stray is 4 MiB; if it
+    // counted, total would be at least 4 MiB).
+    expect(r.stdout).not.toMatch(/Total size:\s+[\d.]+\s*(MiB|GiB|TiB)/);
+  });
+});
+
 test.describe("cache prune --help", () => {
   test("help text describes --yes behaviour accurately", () => {
     const r = runCli(["cache", "prune", "--help"]);
@@ -421,6 +444,29 @@ test.describe("cache prune --all sentinel safety", () => {
     const r = runCli(["cache", "prune", "--all", "--yes"], { env: envWith() });
     expect(r.status).toBe(0);
     expect(fs.existsSync(cacheDir)).toBe(false);
+  });
+
+  test("--all --yes refuses when the sentinel is a symlink", () => {
+    // The guard must verify the sentinel is a regular non-symlink file —
+    // otherwise a symlinked .kicadiff-cache (pointing anywhere) would let
+    // a misconfigured KICADIFF_CACHE_DIR bypass the safety check.
+    const externalTarget = path.join(os.tmpdir(), `not-a-real-sentinel-${process.pid}`);
+    fs.writeFileSync(externalTarget, "");
+    try {
+      fs.symlinkSync(externalTarget, path.join(cacheDir, ".kicadiff-cache"));
+    } catch (e) {
+      // Skip on platforms where symlinks aren't supported (Windows w/o priv)
+      test.skip(true, `symlink creation failed: ${(e as Error).message}`);
+      return;
+    }
+    const stray = path.join(cacheDir, "important.txt");
+    fs.writeFileSync(stray, "do not delete me");
+
+    const r = runCli(["cache", "prune", "--all", "--yes"], { env: envWith() });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toMatch(/sentinel|\.kicadiff-cache|refus/);
+    expect(fs.existsSync(stray)).toBe(true);
+    fs.unlinkSync(externalTarget);
   });
 
   test("walkCache auto-installs the sentinel on first read", () => {
