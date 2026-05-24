@@ -123,6 +123,7 @@ kicadiff project/ --watch --open vscode
 kicadiff project/ -v                    # verbose summary (full PNG paths)
 kicadiff project/ -q                    # suppress summary
 kicadiff project/ --no-cache            # bypass the render cache
+kicadiff project/ --exit-code           # exit 1 if any change (mirrors `git diff --exit-code`)
 
 # Claude Code PostToolUse hook integration. Reads the hook JSON from
 # stdin, renders only when the edited file is .kicad_pcb / .kicad_sch.

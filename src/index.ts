@@ -106,6 +106,8 @@ Options:
   -q, --quiet            Suppress the summary entirely
   --log <level>          Set summary log level: quiet | info | debug (default: info)
   --no-cache             Skip the render cache (default: cached at \$XDG_CACHE_HOME/kicadiff)
+  --exit-code            Exit with status 1 if any change is detected, 0 otherwise.
+                         Errors still exit non-zero. Mirrors \`git diff --exit-code\`.
   --watch                Long-running mode: re-render whenever an input KiCad
                          file changes. Hot reload comes from your viewer —
                          open the diff HTML in VSCode Live Preview, live-server,
@@ -173,6 +175,11 @@ interface ParsedArgs {
    *  viewer is delegated to whatever already serves the HTML (VSCode Live
    *  Preview, live-server, browsersync, etc.). */
   watch?: boolean;
+  /** `git diff --exit-code` semantics: when set, exit 1 if any change is
+   *  detected, 0 otherwise. Errors still exit non-zero as today. Lets CI
+   *  wrappers detect "kicad files changed" via process exit instead of
+   *  parsing stdout. */
+  exitCode?: boolean;
 }
 
 /** Known names that can be used after a bare `--open` (with a space).
@@ -279,6 +286,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let open: string | undefined;
   let watch = false;
   let cached = false;
+  let exitCode = false;
 
   for (; i < argv.length; i++) {
     const arg = argv[i];
@@ -321,6 +329,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       noCache = true;
     } else if (arg === "--watch") {
       watch = true;
+    } else if (arg === "--exit-code") {
+      exitCode = true;
     } else if (arg === "--cached" || arg === "--staged") {
       // `git diff --cached` semantics: compare HEAD against the index.
       // Explicit --from / --to / positional refs still win.
@@ -431,6 +441,18 @@ function parseArgs(argv: string[]): ParsedArgs {
     throw new Error(`bad ref: ${toRef}`);
   }
 
+  // --exit-code only has meaning for one-shot invocations: it signals
+  // "did anything change?" via the process exit status. --watch is a
+  // long-running mode that never exits on its own, so the combination
+  // is incoherent. Reject up front rather than silently dropping the
+  // flag — users mirroring `git diff --exit-code` muscle memory would
+  // otherwise be surprised when their CI wrapper hangs forever.
+  if (watch && exitCode) {
+    throw new Error(
+      "--exit-code is not compatible with --watch (watch is long-running; --exit-code only has meaning for one-shot invocations)",
+    );
+  }
+
   // Validate subcommand vs input extension when input is a single file.
   // Directory and .kicad_pro inputs skip this check (resolveInputs handles
   // scope-filtering). For sym/fp the file may also be a .pretty directory,
@@ -453,6 +475,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   return {
     input, fromRef, toRef, outputDir, outputHtml, imagesOnly, text, textOnly,
     markdown, mdTemplate, mdFileTemplate, logLevel, noCache, scope, open, watch,
+    exitCode,
   };
 }
 
@@ -568,7 +591,11 @@ async function main(): Promise<void> {
 
     // --text-only short-circuits rendering entirely — useful when piping the
     // structural diff into another tool without paying for SVG/PNG.
-    if (parsed.textOnly) { printTextDiff(parsed); return; }
+    if (parsed.textOnly) {
+      const anyChanges = printTextDiff(parsed);
+      if (parsed.exitCode && anyChanges) process.exit(1);
+      return;
+    }
 
     // --markdown skips HTML viewer generation: the markdown is the deliverable
     // and the viewer would be redundant. Images still render so the markdown
@@ -600,9 +627,19 @@ async function main(): Promise<void> {
       // diff to stderr too so it doesn't get prepended to the .md file.
       printTextDiff(parsed, stdoutIsReport ? "stderr" : "stdout");
     }
+    // Track whether the markdown path already computed the per-file change
+    // verdict. When it has, `projectHasChanges` can reuse the result instead
+    // of re-running `computeFileDiff` for every pcb/sch file — that work
+    // already happened inside `buildMarkdownReport`, and on large projects
+    // it's the dominant cost.
+    let mdHasChanges: boolean | undefined;
     if (parsed.markdown) {
       if (!quiet && !stdoutIsReport) newline("");
-      emitMarkdownReport(parsed, project);
+      mdHasChanges = emitMarkdownReport(parsed, project);
+    }
+    if (parsed.exitCode) {
+      const changed = mdHasChanges ?? projectHasChanges(parsed, project);
+      if (changed) process.exit(1);
     }
   } catch (e) {
     console.error(`Error: ${(e as Error).message}`);
@@ -610,16 +647,51 @@ async function main(): Promise<void> {
   }
 }
 
+/** True if any file in the rendered project shows a meaningful change.
+ *  Mirrors the per-file `has_changes` definition exposed to markdown
+ *  templates in buildMarkdownReport: structural diff, visual diff (PNG
+ *  bytes differ), or one side missing entirely. Kept in sync with that
+ *  definition so `--exit-code` and the markdown `{{has_changes}}` flag
+ *  always agree about what counts as a change.
+ *
+ *  Only called when the markdown path didn't already compute the verdict —
+ *  `emitMarkdownReport` returns the same answer as a by-product of building
+ *  the report, so the caller in main() prefers that to avoid re-parsing
+ *  every pcb/sch file twice. */
+function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): boolean {
+  const repoRoot = project.results[0] ? repoRootOf(project.results[0].filePath) : null;
+  // parsed.{from,to}Ref are already pinned at the top of main(); fall back
+  // to the same defaults the rest of the pipeline uses if pinning was a no-op.
+  const fromRef = parsed.fromRef ?? INDEX_REF;
+  const toRef = parsed.toRef ?? "";
+  for (const r of project.results) {
+    const m = r.manifest;
+    const hasBoth = !!(m.hasBefore && r.beforePng && r.afterPng);
+    const afterOnly = !hasBoth && !!r.afterPng;
+    const beforeOnly = !hasBoth && !r.afterPng && !!r.beforePng;
+    if (afterOnly || beforeOnly) return true;
+    if (m.hasDiff) return true;
+    if (m.type === "pcb" || m.type === "sch") {
+      const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
+      if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Resolve inputs and emit a structural text diff for each file. By default
  *  goes to stdout; pass "stderr" to redirect (used when stdout is reserved
  *  for a markdown report being piped into a file). Skips file types that
- *  the text differ doesn't support (sym/fp). */
-function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout"): void {
+ *  the text differ doesn't support (sym/fp). Returns true if any file has
+ *  a non-zero structural delta — used by --exit-code. */
+function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout"): boolean {
   const files = resolveInputs(parsed.input, parsed.scope)
     .filter(f => f.endsWith(".kicad_pcb") || f.endsWith(".kicad_sch"));
   if (files.length === 0) {
     console.error("Warning: text diff supports only .kicad_pcb / .kicad_sch — nothing to diff");
-    return;
+    return false;
   }
   const repoRoot = repoRootOf(files[0]);
   // Pin mutable refs to a commit SHA before any `git show`. textDiff reads
@@ -634,9 +706,22 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
   const out = dest === "stderr"
     ? (s: string) => process.stderr.write(s + "\n")
     : (s: string) => console.log(s);
+  let anyChanges = false;
+  // textDiff already parses both sides internally to produce its formatted
+  // output. The follow-up computeFileDiff parses them again to read the
+  // counts — cheap per file but doubles the parse work on large
+  // .kicad_pcb/.kicad_sch projects. Only pay that cost when --exit-code
+  // actually needs the verdict; the common --text-only path skips it.
+  const needCounts = !!parsed.exitCode;
   for (const f of files) {
     out(textDiff(f, fromRef, toRef, repoRoot));
+    if (!needCounts) continue;
+    const fd = computeFileDiff(f, fromRef, toRef, repoRoot);
+    if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+      anyChanges = true;
+    }
   }
+  return anyChanges;
 }
 
 /** Format a friendly ref label for markdown headings. Mirrors the viewer's
@@ -706,6 +791,17 @@ interface FileTemplateContext extends Record<string, unknown> {
   structural_diff: string;
 }
 
+/** Result of building the markdown report. `hasChanges` mirrors the per-file
+ *  `has_changes` definition (structural diff, visual diff, or one side
+ *  missing) aggregated across the project — same answer `projectHasChanges`
+ *  would arrive at, but obtained as a by-product of the work the markdown
+ *  path already did. Surfaced so `--exit-code` in the markdown path can
+ *  skip the redundant `computeFileDiff` sweep. */
+interface MarkdownReportResult {
+  text: string;
+  hasChanges: boolean;
+}
+
 /** Build the markdown report text. Image paths are emitted relative to
  *  `mdDir` so the file is portable: ship the .md alongside its image
  *  directory and links resolve from any location.
@@ -718,7 +814,7 @@ function buildMarkdownReport(
   parsed: ParsedArgs,
   project: ProjectRenderResult,
   mdDir: string,
-): string {
+): MarkdownReportResult {
   const repoRoot = project.results[0]
     ? repoRootOf(project.results[0].filePath)
     : null;
@@ -812,17 +908,19 @@ function buildMarkdownReport(
 
   const sections = fileContexts.map((ctx) => renderTemplate(fileTemplate, ctx));
   const fileSections = sections.join("\n\n");
+  const hasChanges = fileContexts.some((c) => c.has_changes);
 
-  return renderTemplate(projectTemplate, {
+  const text = renderTemplate(projectTemplate, {
     from_ref: fromRef,
     to_ref: toRef,
     from_label: fromLabel,
     to_label: toLabel,
     file_count: fileContexts.length,
-    has_changes: fileContexts.some((c) => c.has_changes),
+    has_changes: hasChanges,
     files: fileContexts,
     file_sections: fileSections,
   });
+  return { text, hasChanges };
 }
 
 /** Project-level filename for the combined markdown — kept in sync with the
@@ -841,14 +939,19 @@ function projectSafeNameFromResults(project: ProjectRenderResult): string {
 /** Emit the markdown report. Default destination is a file alongside the
  *  rendered images (parallel to the HTML viewer); `--output - / stdout`
  *  redirects to standard output, with image paths relative to CWD so the
- *  user can pipe / redirect somewhere predictable. */
-function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): void {
+ *  user can pipe / redirect somewhere predictable.
+ *
+ *  Returns whether any per-file change was detected, so the caller can
+ *  reuse the verdict for `--exit-code` instead of re-running the
+ *  structural diff. */
+function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): boolean {
   const outArg = parsed.outputHtml; // unified --output / -o flag
   const isStdout = outArg === "-" || outArg === "stdout";
 
   if (isStdout) {
-    process.stdout.write(buildMarkdownReport(parsed, project, process.cwd()));
-    return;
+    const report = buildMarkdownReport(parsed, project, process.cwd());
+    process.stdout.write(report.text);
+    return report.hasChanges;
   }
 
   const outDir = project.results[0]?.outputDir ?? process.cwd();
@@ -857,10 +960,12 @@ function emitMarkdownReport(parsed: ParsedArgs, project: ProjectRenderResult): v
     ? resolveOutputPath(outArg, `${safeName}_diff.md`)
     : path.join(outDir, `${safeName}_diff.md`);
   fs.mkdirSync(path.dirname(mdPath), { recursive: true });
-  fs.writeFileSync(mdPath, buildMarkdownReport(parsed, project, path.dirname(mdPath)));
+  const report = buildMarkdownReport(parsed, project, path.dirname(mdPath));
+  fs.writeFileSync(mdPath, report.text);
   if ((parsed.logLevel ?? "info") !== "quiet") {
     console.log(`Diff markdown: ${mdPath}`);
   }
+  return report.hasChanges;
 }
 
 function repoRootOf(filePath: string): string | null {

@@ -125,6 +125,7 @@ kicadiff project/ --watch --open vscode
 kicadiff project/ -v                    # PNG パスまで出すサマリ
 kicadiff project/ -q                    # サマリ抑止
 kicadiff project/ --no-cache            # キャッシュをバイパス
+kicadiff project/ --exit-code           # 変更があれば exit 1 (`git diff --exit-code` 互換)
 
 # Claude Code PostToolUse hook 統合。stdin から hook の JSON を読んで、
 # 編集対象が .kicad_pcb / .kicad_sch のときだけレンダリングする。
