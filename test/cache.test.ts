@@ -475,6 +475,32 @@ test.describe("cache prune --all sentinel safety", () => {
     expect(fs.existsSync(cacheDir)).toBe(false);
   });
 
+  test("--all --dry-run lists a non-regular-file at the sentinel path as foreign", () => {
+    // The --all guard refuses unless .kicadiff-cache is a regular file
+    // (round-7 hardening). A symlinked sentinel is therefore NOT a
+    // valid sentinel and IS something --all would (try to) wipe — so
+    // the dry-run preview must include it, not silently hide it.
+    const externalTarget = path.join(os.tmpdir(), `fake-sentinel-target-${process.pid}`);
+    fs.writeFileSync(externalTarget, "");
+    try {
+      fs.symlinkSync(externalTarget, path.join(cacheDir, ".kicadiff-cache"));
+    } catch (e) {
+      test.skip(true, `symlink creation failed: ${(e as Error).message}`);
+      return;
+    }
+    const now = Date.now();
+    makeEntry(cacheDir, "ddddddddddd", 100, now);
+    // makeEntry would have tried to drop the sentinel too; ours is the
+    // symlink, which existsSync sees as present so makeEntry leaves it.
+    // Re-assert that's still the case.
+    expect(fs.lstatSync(path.join(cacheDir, ".kicadiff-cache")).isSymbolicLink()).toBe(true);
+
+    const r = runCli(["cache", "prune", "--all", "--dry-run"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Would also wipe:[^\n]*\.kicadiff-cache/);
+    fs.unlinkSync(externalTarget);
+  });
+
   test("--all --yes refuses when the sentinel is a symlink", () => {
     // The guard must verify the sentinel is a regular non-symlink file —
     // otherwise a symlinked .kicadiff-cache (pointing anywhere) would let

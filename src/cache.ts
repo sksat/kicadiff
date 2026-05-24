@@ -254,10 +254,15 @@ export function listForeignTopLevel(cacheDir: string): string[] {
   }
   const foreign: string[] = [];
   for (const top of topLevel) {
-    if (top.name === SENTINEL_NAME) continue;
     const topPath = path.join(cacheDir, top.name);
     let st: fs.Stats;
     try { st = fs.lstatSync(topPath); } catch { continue; }
+    // Filter the sentinel out ONLY when it's the real thing: a regular,
+    // non-symlink file (matching what the --all guard accepts). A
+    // symlink or directory at the sentinel path isn't a valid guard
+    // marker and is something --all would still try to wipe, so it
+    // needs to appear in the dry-run preview.
+    if (top.name === SENTINEL_NAME && st.isFile()) continue;
     if (st.isDirectory()) {
       if (BUCKET_NAME_RE.test(top.name)) continue; // recognised bucket
       foreign.push(`${top.name}/`);
