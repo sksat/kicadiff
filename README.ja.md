@@ -178,7 +178,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
-      - uses: sksat/kicadiff@v0.1.0
+      - uses: sksat/kicadiff@v0.2.0
         with:
           path: hardware/main-board   # 既定は cwd
           upload-artifact: 'true'
