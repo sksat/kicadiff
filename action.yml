@@ -273,23 +273,31 @@ runs:
         echo "::endgroup::"
 
         # Cache makes this near-free since run 1 populated it.
-        echo "::group::kicadiff --text-only"
-        "${KICADIFF_CMD[@]}" "${REF_ARGS[@]}" --text-only \
+        # --exit-code returns 0 = no changes, 1 = changes detected
+        # (any structural diff: components or nets), * = error. The
+        # previous "grep indented +/-/~ rows" approach used a heuristic
+        # on the printed format; doing it via process exit is what
+        # kicadiff exposes the flag for and obsoletes the heuristic.
+        # Requires kicadiff >= 0.2.0 (--exit-code was added in #14).
+        # `set +e` + PIPESTATUS so a "changes detected" exit doesn't
+        # tear down the whole step, and tee still writes the report.
+        echo "::group::kicadiff --text-only --exit-code"
+        set +e
+        "${KICADIFF_CMD[@]}" "${REF_ARGS[@]}" --text-only --exit-code \
           -- "$INPUT_PATH" \
           | tee "$TXT_PATH"
+        KICADIFF_EXIT=${PIPESTATUS[0]}
+        set -e
         echo "::endgroup::"
 
-        # kicadiff --text-only emits per-file summary lines (`<file>:
-        # +A -R ~C =U`) followed by indented `  + ...` / `  - ...` /
-        # `  ~ ...` rows for each affected component. We grep for a
-        # detail row rather than the summary because a file with all
-        # zeros still gets a summary line. Two leading spaces plus a
-        # diff marker is the unique shape of the detail rows.
-        if [ -s "$TXT_PATH" ] && grep -qE "^[[:space:]]+[+\-~] " "$TXT_PATH"; then
-          HAS_CHANGES=true
-        else
-          HAS_CHANGES=false
-        fi
+        case "$KICADIFF_EXIT" in
+          0) HAS_CHANGES=false ;;
+          1) HAS_CHANGES=true ;;
+          *)
+            echo "::error::kicadiff --text-only exited $KICADIFF_EXIT"
+            exit "$KICADIFF_EXIT"
+            ;;
+        esac
 
         {
           echo "markdown-path=$MD_PATH"
