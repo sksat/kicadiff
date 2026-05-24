@@ -303,12 +303,13 @@ test.describe("kicadiff check (integration)", () => {
 
   test("introducing an ERC violation: exits 1, reports +N new", () => {
     // The blink schematic already has 5 ERC violations (pin_not_connected on
-    // ERC markers). Removing a wire segment from a net is a heavy-handed but
-    // deterministic way to add a new dangling-pin / no-connect-style violation
-    // on top of the existing baseline; here we take the simpler approach of
-    // deleting an unrelated junction by stripping a `(no_connect ...)` from
-    // the schematic — every NC marker that disappears flips a previously-
-    // suppressed pin back into a "Pin not connected" error.
+    // ERC markers). Removing a wire segment from a net is a deterministic way
+    // to add new dangling-wire / pin-not-connected violations on top of the
+    // existing baseline: deleting one `(wire ...)` block breaks the
+    // connection between two pins, so previously-connected pins now ERC as
+    // unconnected. We delete the FIRST `(wire ` block and walk parens to find
+    // its matching `)` (the block contains nested `(stroke ...)`, `(uuid ...)`
+    // and `(pts ...)` groups, so a naive regex would close at the first `)`).
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-erc-"));
     try {
       initRepoWithBlink(tmp);
@@ -426,6 +427,46 @@ test.describe("kicadiff check (integration)", () => {
       // Skipping is fine; the only requirement is that the command doesn't
       // crash and doesn't report a phantom violation.
       expect(r.status).toBe(0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("all-unsupported inputs: prints only the aggregated skip line, not 'no inputs to check'", () => {
+    // Regression for Copilot review round 2 on PR #17: when every input is
+    // an unsupported type (e.g. a lone .kicad_sym), the previous output was
+    //   kicadiff check: skipped 1 unsupported file ...
+    //   kicadiff check: no .kicad_pcb / .kicad_sch inputs to check
+    // The second line reads like the user passed nothing — confusing in the
+    // all-unsupported case. We want the aggregate-skip line ONLY here.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-all-unsup-"));
+    try {
+      initRepoWithBlink(tmp);
+      const symFile = path.join(tmp, "stub.kicad_sym");
+      fs.writeFileSync(symFile, "(kicad_symbol_lib (version 20211014) (generator kicadiff_test))");
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "add", "stub.kicad_sym",
+      ], { cwd: tmp });
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-q", "-m", "add sym",
+      ], { cwd: tmp });
+
+      // Pass the .kicad_sym file explicitly so resolveInputs returns ONLY
+      // unsupported files. (Handing the project dir would also pull in the
+      // PCB and schematic, which would defeat the "all-unsupported" case.)
+      const r = spawnSync(CLI, ["check", "HEAD", "HEAD", symFile], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(r.status).toBe(0);
+      // The aggregated skip line must appear exactly once.
+      const stderr = r.stderr ?? "";
+      const skipLines = stderr.split("\n").filter((l) => /skipped\s+\d+\s+unsupported/i.test(l));
+      expect(skipLines.length).toBe(1);
+      // And the "no inputs to check" line must NOT appear — it's redundant
+      // here because the skip line already explains why nothing ran.
+      expect(stderr).not.toMatch(/no .kicad_pcb \/ .kicad_sch inputs to check/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

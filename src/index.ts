@@ -52,10 +52,12 @@ Subcommands:
              Defaults to \`--open vscode\`; pass \`--open ...\` to override.
   check      Run DRC (.kicad_pcb) / ERC (.kicad_sch) on both sides and report
              the violation delta as +N new / -M fixed / =K unchanged. Exits 1
-             iff there are NEW violations on the target side, so the gate
-             fails only on regressions — pre-existing violations that persist
-             do not fail the check. Same positional shape as bare \`kicadiff\`
-             (refs first, input last). Skips .kicad_sym / .kicad_mod.
+             when NEW violations are introduced on the target side, so the
+             gate fails only on regressions — pre-existing violations that
+             persist do not fail the check. Operational failures (missing
+             kicad-cli, git errors, JSON parse errors) also produce a
+             non-zero exit. Same positional shape as bare \`kicadiff\` (refs
+             first, input last). Skips .kicad_sym / .kicad_mod.
 
 Inputs (positional):
   <input>    One of:
@@ -736,7 +738,14 @@ function runCheckCli(parsed: ParsedArgs): number {
     );
   }
   if (supported.length === 0) {
-    console.error("kicadiff check: no .kicad_pcb / .kicad_sch inputs to check");
+    // Only print the "no inputs to check" hint when the user genuinely passed
+    // nothing checkable AND nothing was skipped — i.e. resolveInputs found no
+    // files at all. In the all-unsupported case the aggregated skip line above
+    // already explains why nothing ran; adding "no inputs to check" on top of
+    // it reads like the user passed nothing, which is misleading.
+    if (skipped.length === 0) {
+      console.error("kicadiff check: no .kicad_pcb / .kicad_sch inputs to check");
+    }
     return 0;
   }
   const repoRoot = repoRootOf(supported[0]);

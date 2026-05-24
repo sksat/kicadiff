@@ -21,9 +21,11 @@ file in your browser, or as a markdown report you can paste into a PR.
   rendering, prints to stdout.
 - **DRC / ERC violation diff** (`kicadiff check`) — runs design-rule and
   electrical-rule checks on both sides and reports the delta as
-  `+N new / -M fixed / =K unchanged`. Exits non-zero only on NEW
-  violations, so it makes a good PR gate that fails on regressions
-  while ignoring pre-existing findings.
+  `+N new / -M fixed / =K unchanged`. Exits 1 when the target side
+  introduces NEW violations (non-zero on operational failures too —
+  missing `kicad-cli`, git errors, JSON parse errors), so it makes a
+  good PR gate that fails on regressions while ignoring pre-existing
+  findings.
 
 ## Requirements
 
@@ -138,9 +140,11 @@ kicadiff hook
 # DRC / ERC violation diff — third fast-path mode alongside --text-only.
 # Runs `kicad-cli pcb drc` (PCB) / `kicad-cli sch erc` (schematic) on both
 # sides and reports the delta as +N new / -M fixed / =K unchanged. Exits 1
-# iff there are NEW violations on the target side; pre-existing violations
-# that persist do not fail the gate. Useful as a PR gate that fails only on
-# regressions, independent of any visual diff.
+# when NEW violations are introduced on the target side; pre-existing
+# violations that persist do not fail the gate. Operational failures
+# (missing kicad-cli, git errors, JSON parse errors) also produce a
+# non-zero exit. Useful as a PR gate that fails only on regressions,
+# independent of any visual diff.
 kicadiff check                          # PCB+sch in cwd, index vs working
 kicadiff check HEAD project/            # working tree vs HEAD
 kicadiff check main..feat foo.kicad_pcb # main vs feat, PCB only

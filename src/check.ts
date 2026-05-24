@@ -11,10 +11,15 @@
  * signature. The signature choice is deliberately conservative — see
  * `signatureOf` for the why.
  *
- * Exit semantics: `kicadiff check` exits 1 iff there are NEW violations on
+ * Exit semantics: `kicadiff check` exits 1 when there are NEW violations on
  * the target side (i.e. `added.length > 0` for any input). Pre-existing
  * violations that persist do not fail the gate — the point of `check` is
  * "did this change introduce something?" rather than "is the design clean?".
+ * Operational failures (missing kicad-cli, git errors, JSON parse errors)
+ * propagate as exceptions and also produce a non-zero exit; we deliberately
+ * don't differentiate the exit code today (any non-zero is non-zero). A
+ * possible follow-up: emit 1 for new violations and 2 for tool failures so
+ * CI can distinguish "your change broke something" from "the gate broke".
  */
 
 import { spawnSync, execFileSync } from "node:child_process";
