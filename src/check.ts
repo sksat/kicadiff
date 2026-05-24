@@ -146,7 +146,28 @@ function runKicadCli(
   opLabel: string,
   input: string,
 ): void {
-  const r = spawnSync("kicad-cli", args, { stdio: ["ignore", "pipe", "pipe"] });
+  // stdio choices:
+  //   - stdin "ignore": kicad-cli never reads from stdin for these subcommands.
+  //   - stdout "ignore": the violation report goes to --output <path>, so the
+  //     stdout stream is just progress / log noise we never read. Discarding
+  //     it side-steps Node's spawnSync 1 MiB default maxBuffer, which a
+  //     verbose kicad-cli (many violations) could blow through; ENOBUFS would
+  //     then surface via r.error and be misreported as a launch failure.
+  //   - stderr "pipe" with a generous maxBuffer: we DO want stderr for the
+  //     non-zero-exit diagnostic below, but realistically it stays small even
+  //     on large boards. 16 MiB is overkill so a flood doesn't mask the real
+  //     problem with an ENOBUFS.
+  const r = spawnSync("kicad-cli", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  // ENOBUFS on stderr is unlikely but possible; surface it as a distinct
+  // operational failure rather than letting it masquerade as a launch error.
+  if (r.error && (r.error as NodeJS.ErrnoException).code === "ENOBUFS") {
+    throw new Error(
+      `kicad-cli ${opLabel} emitted more diagnostic output than we can capture for ${input}: ${r.error.message}`,
+    );
+  }
   // (1) Launch failure (ENOENT, EACCES, …). spawnSync sets `r.error` and
   // leaves `r.status` null in this case. Surface the underlying cause —
   // the previous implementation only checked output-file existence and
@@ -184,7 +205,7 @@ export function runDrc(inputPcb: string, outputJson: string): Violation[] {
     ["pcb", "drc", "--severity-all", "--format", "json", "--output", outputJson, inputPcb],
     outputJson, "pcb drc", inputPcb,
   );
-  return parseDrcViolations(outputJson);
+  return parseDrcViolations(outputJson, inputPcb);
 }
 
 export function runErc(inputSch: string, outputJson: string): Violation[] {
@@ -192,7 +213,7 @@ export function runErc(inputSch: string, outputJson: string): Violation[] {
     ["sch", "erc", "--severity-all", "--format", "json", "--output", outputJson, inputSch],
     outputJson, "sch erc", inputSch,
   );
-  return parseErcViolations(outputJson);
+  return parseErcViolations(outputJson, inputSch);
 }
 
 interface RawViolation {
@@ -219,12 +240,43 @@ function normalizeRaw(raw: RawViolation): Violation {
   };
 }
 
+/** Read + JSON.parse a kicad-cli report, attaching report-path and
+ *  input-path context to any parse failure. Bare JSON.parse errors look
+ *  like `Unexpected token ... in JSON at position N`, which gives the
+ *  user no way to tell *which* file's report is broken — particularly
+ *  bad on multi-file `kicadiff check` runs where the parse happens after
+ *  the input file is no longer in scope. We rethrow with both paths so
+ *  CI logs identify the offending board/sheet directly.
+ *
+ *  `inputPath` is the .kicad_pcb / .kicad_sch that produced the report,
+ *  surfaced separately from `jsonPath` because the two diverge (the
+ *  report lives in a temp dir alongside its scratch project copy). */
+function readReportJson(jsonPath: string, inputPath: string, opLabel: string): unknown {
+  let text: string;
+  try {
+    text = fs.readFileSync(jsonPath, "utf8");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `failed to read kicad-cli ${opLabel} report ${jsonPath} for ${inputPath}: ${msg}`,
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `failed to parse kicad-cli ${opLabel} report ${jsonPath} for ${inputPath}: ${msg}`,
+    );
+  }
+}
+
 /** DRC JSON shape (schemas.kicad.org/drc.v1): top-level `violations`,
  *  `unconnected_items`, `schematic_parity` arrays. All three are findings
  *  the user has to deal with, so we fold them all into the same Violation
  *  stream. */
-export function parseDrcViolations(jsonPath: string): Violation[] {
-  const j = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+export function parseDrcViolations(jsonPath: string, inputPath: string): Violation[] {
+  const j = readReportJson(jsonPath, inputPath, "pcb drc") as Record<string, unknown> | null;
   const out: Violation[] = [];
   for (const key of ["violations", "unconnected_items", "schematic_parity"]) {
     const arr = j?.[key];
@@ -239,8 +291,8 @@ export function parseDrcViolations(jsonPath: string): Violation[] {
  *  sheet under top-level `sheets[]`. Flatten across all sheets — the
  *  per-sheet grouping is more useful for the human-readable report than
  *  for diffing, and individual item descriptions encode the sheet path. */
-export function parseErcViolations(jsonPath: string): Violation[] {
-  const j = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+export function parseErcViolations(jsonPath: string, inputPath: string): Violation[] {
+  const j = readReportJson(jsonPath, inputPath, "sch erc") as { sheets?: unknown } | null;
   const out: Violation[] = [];
   const sheets = j?.sheets;
   if (Array.isArray(sheets)) {

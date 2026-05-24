@@ -252,6 +252,137 @@ test.describe("runDrc / runErc error surfacing", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  test("runDrc: corrupt DRC report JSON surfaces report path AND input path", () => {
+    // Copilot review round 3, Comment B: parseDrcViolations used to let
+    // JSON.parse exceptions bubble up bare ("Unexpected token …"), which
+    // hides *which* report/input is broken. The diagnostic must identify
+    // both the report file on disk and the .kicad_pcb that was checked.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-drc-corrupt-"));
+    const origPath = process.env.PATH;
+    try {
+      // Shim kicad-cli to write a corrupt JSON report to the path that
+      // runKicadCli expects, then exit cleanly. Mimics partial-write /
+      // disk-corruption scenarios.
+      const shim = path.join(tmp, "kicad-cli");
+      // `"$@"` carries through kicad-cli's argv; we just need the value of
+      // --output. Use a tiny shell snippet that walks args.
+      fs.writeFileSync(shim, [
+        "#!/bin/sh",
+        "out=",
+        "while [ $# -gt 0 ]; do",
+        "  case \"$1\" in",
+        "    --output) out=\"$2\"; shift 2 ;;",
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        "printf '{broken' > \"$out\"",
+        "exit 0",
+      ].join("\n"));
+      fs.chmodSync(shim, 0o755);
+      process.env.PATH = tmp;
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      const reportPath = path.join(tmp, "report.json");
+      let caught: Error | null = null;
+      try {
+        runDrc(fakePcb, reportPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).not.toBeNull();
+      // The error must name BOTH the report file and the input file so a
+      // user reading CI logs can trace which board produced the broken
+      // report.
+      expect(caught!.message).toContain(reportPath);
+      expect(caught!.message).toContain(fakePcb);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runErc: corrupt ERC report JSON surfaces report path AND input path", () => {
+    // Copilot review round 3, Comment C: same shape as the DRC case.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-erc-corrupt-"));
+    const origPath = process.env.PATH;
+    try {
+      const shim = path.join(tmp, "kicad-cli");
+      fs.writeFileSync(shim, [
+        "#!/bin/sh",
+        "out=",
+        "while [ $# -gt 0 ]; do",
+        "  case \"$1\" in",
+        "    --output) out=\"$2\"; shift 2 ;;",
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        "printf '{broken' > \"$out\"",
+        "exit 0",
+      ].join("\n"));
+      fs.chmodSync(shim, 0o755);
+      process.env.PATH = tmp;
+      const fakeSch = path.join(tmp, "fake.kicad_sch");
+      fs.writeFileSync(fakeSch, "");
+      const reportPath = path.join(tmp, "report.json");
+      let caught: Error | null = null;
+      try {
+        runErc(fakeSch, reportPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.message).toContain(reportPath);
+      expect(caught!.message).toContain(fakeSch);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runDrc: large kicad-cli stdout does not trip ENOBUFS", () => {
+    // Copilot review round 3, Comment A: the previous spawnSync used
+    // `stdio: [..., "pipe", "pipe"]` without a maxBuffer override, so a
+    // kicad-cli emitting more than ~1MB on stdout (plausible with many
+    // violations) would fail with ENOBUFS and get misreported as a launch
+    // failure via r.error. The fix is to discard stdout entirely. We
+    // simulate the bad case with a shim that emits 2 MiB to stdout, then
+    // writes a valid (empty) report to --output and exits 0.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-bigout-"));
+    const origPath = process.env.PATH;
+    try {
+      const shim = path.join(tmp, "kicad-cli");
+      fs.writeFileSync(shim, [
+        "#!/bin/sh",
+        "out=",
+        "while [ $# -gt 0 ]; do",
+        "  case \"$1\" in",
+        "    --output) out=\"$2\"; shift 2 ;;",
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        // 2 MiB to stdout — well above Node's 1 MiB default spawnSync
+        // maxBuffer, which would previously trip ENOBUFS.
+        "dd if=/dev/zero bs=1024 count=2048 2>/dev/null",
+        // Valid empty DRC report so parseDrcViolations succeeds.
+        "printf '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$out\"",
+        "exit 0",
+      ].join("\n"));
+      fs.chmodSync(shim, 0o755);
+      process.env.PATH = tmp;
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      const reportPath = path.join(tmp, "report.json");
+      // The call must complete and return an empty violations array. With
+      // the old `stdio: "pipe"` form this throws ENOBUFS-mediated launch
+      // failure instead.
+      const violations = runDrc(fakePcb, reportPath);
+      expect(violations).toEqual([]);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // =============================================================================
