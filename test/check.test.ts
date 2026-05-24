@@ -9,6 +9,8 @@ import {
   diffViolations,
   signatureOf,
   formatCheckDiff,
+  runDrc,
+  runErc,
   type Violation,
 } from "../src/check.ts";
 
@@ -162,6 +164,97 @@ test.describe("formatCheckDiff", () => {
 });
 
 // =============================================================================
+// runDrc / runErc surface launch failures with actionable diagnostics.
+// Without this, a missing kicad-cli on PATH degrades to a generic
+// "report file missing" error that hides ENOENT.
+// =============================================================================
+
+test.describe("runDrc / runErc error surfacing", () => {
+  test("runDrc: missing kicad-cli surfaces ENOENT / launch error", () => {
+    // Tmpdir name avoids substrings that would collide with the diagnostic
+    // regex below (no "enoent", "not found", "PATH") — we want the assertion
+    // to pin on the *thrown message text*, not on the fixture path.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-drc-fail-"));
+    const origPath = process.env.PATH;
+    try {
+      // Wipe PATH so `kicad-cli` is unresolvable — spawnSync should populate
+      // r.error with ENOENT. The previous implementation only checked the
+      // output file existence and threw a generic "drc failed" message.
+      process.env.PATH = "/nonexistent-kicadiff-test";
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      const reportPath = path.join(tmp, "report.json");
+      let caught: Error | null = null;
+      try {
+        runDrc(fakePcb, reportPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).not.toBeNull();
+      // The error must mention either ENOENT or "not found" / "PATH" so the
+      // user can act on it; the bare "drc failed" message is what we're
+      // replacing.
+      expect(caught!.message).toMatch(/ENOENT|not found|PATH/i);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runErc: missing kicad-cli surfaces ENOENT / launch error", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-erc-fail-"));
+    const origPath = process.env.PATH;
+    try {
+      process.env.PATH = "/nonexistent-kicadiff-test";
+      const fakeSch = path.join(tmp, "fake.kicad_sch");
+      fs.writeFileSync(fakeSch, "");
+      const reportPath = path.join(tmp, "report.json");
+      let caught: Error | null = null;
+      try {
+        runErc(fakeSch, reportPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.message).toMatch(/ENOENT|not found|PATH/i);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runDrc: non-zero exit from kicad-cli includes the exit status", () => {
+    // Stand up a `kicad-cli` shim that exits non-zero without writing a
+    // report file. The error message must include the exit status so the
+    // user can distinguish "tool refused the file" (e.g. exit 2 = bad input)
+    // from "tool crashed".
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-exit-"));
+    const origPath = process.env.PATH;
+    try {
+      const shim = path.join(tmp, "kicad-cli");
+      fs.writeFileSync(shim, "#!/bin/sh\necho 'simulated drc failure' >&2\nexit 2\n");
+      fs.chmodSync(shim, 0o755);
+      process.env.PATH = tmp;
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      const reportPath = path.join(tmp, "report.json");
+      let caught: Error | null = null;
+      try {
+        runDrc(fakePcb, reportPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).not.toBeNull();
+      // The exit status (2) must appear somewhere in the diagnostic.
+      expect(caught!.message).toMatch(/\b2\b/);
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =============================================================================
 // Integration tests for the `kicadiff check` subcommand.
 //
 // `examples/blink/blink.kicad_pcb` is DRC-clean (no violations).
@@ -252,6 +345,59 @@ test.describe("kicadiff check (integration)", () => {
       expect(r.status).toBe(1);
       // The summary must show at least one added violation.
       expect(r.stdout).toMatch(/\+[1-9]\d*\b/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("aggregates unsupported-file skips into a single summary line", () => {
+    // A .pretty/ footprint library can contain dozens of .kicad_mod files.
+    // resolveInputs auto-includes them when handed the parent project, and
+    // the previous implementation printed one stderr line per skipped file —
+    // which floods CI logs. The skip notices must collapse to a single
+    // summary line regardless of how many footprints live in the library.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-pretty-"));
+    try {
+      initRepoWithBlink(tmp);
+      // Build a sibling <project>.pretty/ library with several .kicad_mod
+      // files. They share the project basename so `scanProjectSiblings`
+      // auto-picks them up during `resolveInputs`.
+      const projBase = path.basename(BLINK_PCB, ".kicad_pcb");
+      const prettyDir = path.join(tmp, `${projBase}.pretty`);
+      fs.mkdirSync(prettyDir, { recursive: true });
+      const modCount = 5;
+      for (let i = 0; i < modCount; i++) {
+        fs.writeFileSync(
+          path.join(prettyDir, `stub_${i}.kicad_mod`),
+          "(footprint stub (version 20240108) (generator kicadiff_test))",
+        );
+      }
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "add", ".",
+      ], { cwd: tmp });
+      execFileSync("git", [
+        "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-q", "-m", "add pretty",
+      ], { cwd: tmp });
+
+      // Hand the project directory to `check` — resolveInputs will fold in
+      // all the .kicad_mod files alongside the .kicad_pcb / .kicad_sch.
+      const r = spawnSync(CLI, ["check", "HEAD", "HEAD", tmp], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(r.status).toBe(0);
+      // Count the per-file skip lines. The fix collapses these into ONE
+      // summary line ("Skipped N unsupported files…"); the regression we're
+      // guarding against would emit one such line per .kicad_mod.
+      const perFileSkipLines = (r.stderr ?? "")
+        .split("\n")
+        .filter((l) => /skipping unsupported file type/.test(l));
+      expect(perFileSkipLines.length).toBeLessThanOrEqual(1);
+      // And we should still get *some* indication that files were skipped
+      // — either the per-file (<=1) message or a summary count.
+      const skippedSummary = (r.stderr ?? "").match(/[Ss]kipped\s+\d+/);
+      expect(perFileSkipLines.length + (skippedSummary ? 1 : 0)).toBeGreaterThan(0);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

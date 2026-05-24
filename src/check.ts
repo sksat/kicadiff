@@ -124,40 +124,69 @@ export function diffViolations(
 // kicad-cli invocation + JSON parsing
 // =============================================================================
 
+/** Invoke `kicad-cli` and require it to leave `outputJson` on disk.
+ *
+ *  Shared between runDrc / runErc — both are "run kicad-cli, then read back
+ *  the JSON report it wrote" and they differ only in subcommand + label. We
+ *  centralise the error surfacing here so launch failures (ENOENT when the
+ *  binary isn't on PATH, EACCES, etc.) and non-zero exits both produce
+ *  actionable diagnostics instead of degrading to "report file missing".
+ *
+ *  `opLabel` is the human-readable subcommand ("pcb drc" / "sch erc") used
+ *  in the error message; `input` is the file being checked, surfaced so the
+ *  user can tell *which* board/sheet provoked the failure. */
+function runKicadCli(
+  args: readonly string[],
+  outputJson: string,
+  opLabel: string,
+  input: string,
+): void {
+  const r = spawnSync("kicad-cli", args, { stdio: ["ignore", "pipe", "pipe"] });
+  // (1) Launch failure (ENOENT, EACCES, …). spawnSync sets `r.error` and
+  // leaves `r.status` null in this case. Surface the underlying cause —
+  // the previous implementation only checked output-file existence and
+  // threw a generic "drc failed" that hid "command not found" entirely.
+  if (r.error) {
+    const err = r.error as NodeJS.ErrnoException;
+    const hint = err.code === "ENOENT"
+      ? " (is kicad-cli installed and on PATH?)"
+      : "";
+    throw new Error(
+      `kicad-cli ${opLabel} could not be launched for ${input}: ${err.message}${hint}`,
+    );
+  }
+  // (2) Process ran but didn't produce the report. Include the exit
+  // status so users can distinguish "tool rejected this file" (e.g. exit
+  // 2 = bad input) from "tool crashed" — and append stderr verbatim.
+  // We're lenient on a *non-zero exit alone* because `kicad-cli pcb drc`
+  // historically returned non-zero on `--exit-code-violations`; the
+  // contract here is "the report file must exist".
+  if (!fs.existsSync(outputJson)) {
+    const stderr = (r.stderr ?? "").toString().trim();
+    const status = r.status === null ? "no exit status" : `exit ${r.status}`;
+    throw new Error(
+      `kicad-cli ${opLabel} failed for ${input} (${status})${stderr ? `: ${stderr}` : ""}`,
+    );
+  }
+}
+
 /** Run `kicad-cli pcb drc --format json` on `inputPcb` and return the parsed
  *  violations. We pass `--severity-all` so the diff sees every level
  *  (errors, warnings, exclusions) — under-reporting at the source would be
  *  unrecoverable downstream. */
 export function runDrc(inputPcb: string, outputJson: string): Violation[] {
-  const r = spawnSync("kicad-cli", [
-    "pcb", "drc",
-    "--severity-all",
-    "--format", "json",
-    "--output", outputJson,
-    inputPcb,
-  ], { stdio: ["ignore", "pipe", "pipe"] });
-  // kicad-cli pcb drc exits 5 when violations are found with default flags;
-  // with `--exit-code-violations` omitted it should be 0. Be lenient on exit
-  // code but require the report file to exist.
-  if (!fs.existsSync(outputJson)) {
-    const stderr = (r.stderr ?? "").toString().trim();
-    throw new Error(`kicad-cli pcb drc failed for ${inputPcb}${stderr ? `: ${stderr}` : ""}`);
-  }
+  runKicadCli(
+    ["pcb", "drc", "--severity-all", "--format", "json", "--output", outputJson, inputPcb],
+    outputJson, "pcb drc", inputPcb,
+  );
   return parseDrcViolations(outputJson);
 }
 
 export function runErc(inputSch: string, outputJson: string): Violation[] {
-  const r = spawnSync("kicad-cli", [
-    "sch", "erc",
-    "--severity-all",
-    "--format", "json",
-    "--output", outputJson,
-    inputSch,
-  ], { stdio: ["ignore", "pipe", "pipe"] });
-  if (!fs.existsSync(outputJson)) {
-    const stderr = (r.stderr ?? "").toString().trim();
-    throw new Error(`kicad-cli sch erc failed for ${inputSch}${stderr ? `: ${stderr}` : ""}`);
-  }
+  runKicadCli(
+    ["sch", "erc", "--severity-all", "--format", "json", "--output", outputJson, inputSch],
+    outputJson, "sch erc", inputSch,
+  );
   return parseErcViolations(outputJson);
 }
 

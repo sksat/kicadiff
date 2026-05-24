@@ -724,8 +724,16 @@ function runCheckCli(parsed: ParsedArgs): number {
   const files = resolveInputs(parsed.input, parsed.scope);
   const supported = files.filter((f) => checkKindFor(f) !== null);
   const skipped = files.filter((f) => checkKindFor(f) === null);
-  for (const f of skipped) {
-    console.error(`kicadiff check: skipping unsupported file type: ${f}`);
+  // Aggregate skips into one summary line. resolveInputs auto-includes every
+  // .kicad_mod inside a sibling .pretty/ library, so a footprint library can
+  // produce dozens of "unsupported" entries — printing one stderr line each
+  // would flood CI logs without telling the user anything useful.
+  if (skipped.length > 0) {
+    const sample = skipped.slice(0, 3).map((f) => path.basename(f)).join(", ");
+    const more = skipped.length > 3 ? `, …` : "";
+    console.error(
+      `kicadiff check: skipped ${skipped.length} unsupported file${skipped.length === 1 ? "" : "s"} (.kicad_sym / .kicad_mod not supported by check): ${sample}${more}`,
+    );
   }
   if (supported.length === 0) {
     console.error("kicadiff check: no .kicad_pcb / .kicad_sch inputs to check");
