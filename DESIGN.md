@@ -151,8 +151,14 @@ foo.kicad_pcb (pcb): +0 -0 ~3 =42
 - KiCad 10: `(net "<name>")` — 名前は index 1、トップレベルの
   net 表は消えた。
 
-両方サポートする。トップレベル表が無い場合は、pad の `(net ...)`
-membership から名前集合を逆算する (`examples/mcu-board` がこの経路)。
+両方サポートする。トップレベル表が無い場合は、PCB sexp 全体を歩いて
+すべての `(net ...)` membership (pad / segment / via / zone / track など)
+から名前集合を逆算する (`examples/mcu-board` がこの経路)。pad だけを見ると、
+copper にしか乗っていないネット (segment や zone のみで参照されているもの)
+を取りこぼし、後で pad が繋がった時点で擬似的な「追加されたネット」として
+報告してしまう。`padNets` は引き続き pad のみを対象にする — segment / via /
+zone は配線位置を頻繁に動かすが電気的な意図は変わらないので、object 単位で
+diff する意味があるのは pad の rewire だけ。
 
 `""` (unconnected) は **名前集合からのみ** 除外する (unrouted pad の
 churn で diff が埋まるのを防ぐ)。一方で pad 単位の変更行では
