@@ -374,6 +374,16 @@ function saveToCache(
   const cacheDir = cachePathFor(hash);
   try {
     fs.mkdirSync(cacheDir, { recursive: true });
+    // Drop the `.kicadiff-cache` sentinel at the cache root. The marker
+    // gates `kicadiff cache prune --all` so a misconfigured
+    // KICADIFF_CACHE_DIR can't silently wipe an unrelated directory.
+    // Best-effort: ignored if the FS rejects the write, since the
+    // worst consequence is that `--all` will require the user to
+    // create the marker manually.
+    try {
+      const sentinel = path.join(getCacheRoot(), ".kicadiff-cache");
+      if (!fs.existsSync(sentinel)) fs.writeFileSync(sentinel, "");
+    } catch { /* non-fatal */ }
     fs.copyFileSync(targetPng, path.join(cacheDir, "combined.png"));
     if (fs.existsSync(targetSvg)) {
       fs.copyFileSync(targetSvg, path.join(cacheDir, "combined.svg"));

@@ -554,6 +554,23 @@ leaf を削除した後、空になった bucket dir (`<hash[0:2]>/`) も rmdir
 の hex 名検証で walk が無視した foreign file (`README` 等) も含めて
 "すべて" 消すことを保証する (advertised behaviour に一致させる)。
 
+`--all` の安全装置として、キャッシュ root に `.kicadiff-cache`
+sentinel file が無くかつ認識可能な leaf が一つも無い場合は削除を
+拒否する。これは `KICADIFF_CACHE_DIR` を誤って `$HOME` 等に設定して
+しまった場合に無関係なディレクトリを丸ごと吹き飛ばすのを防ぐため。
+sentinel は初回 cache write 時 (`saveToCache`) および初回 read 時
+(`walkCache`、認識可能な leaf を見つけたとき) に best-effort で配置
+されるので、本 PR 以前から存在するキャッシュも次回利用時に自動で
+upgrade される。ユーザーが本当に対象ディレクトリを消したい場合は
+`rm -rf` を手動で実行する。
+
+`cache stats` が読み出すサイズは `walkCache` の単一 traversal で
+算出する: 以前の実装は leaf ごとに `sumDir` を呼んだ後さらに root
+全体に対して `sumDir` を呼んでいて (大きいキャッシュで 2x I/O)、
+これを単一パスにまとめた。サイズ計算は通常のファイルサイズの合計
+(directory entry 自身は 0 bytes 扱い) で、`du -sb` の symlink 非追跡
+版に近い。
+
 walk 自体も traversal escape に対して防御してある: bucket 名は厳密に
 2 桁 hex、leaf 名は hex のみを許可し、bucket / leaf の `lstat` を見て
 symlink は辿らない。`sumDir` も `lstat` ベースで symlink を一切カウント

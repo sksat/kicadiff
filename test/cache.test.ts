@@ -279,3 +279,59 @@ test.describe("cache prune --help", () => {
     expect(r.stdout.toLowerCase()).toMatch(/non-tty/);
   });
 });
+
+test.describe("cache prune --all sentinel safety", () => {
+  // `--all` recursively deletes the cache root. A misconfigured
+  // KICADIFF_CACHE_DIR (e.g. pointing at $HOME by mistake) must not
+  // silently wipe an unrelated directory. We require a `.kicadiff-cache`
+  // sentinel file at the root before allowing the destructive rm.
+  test("--all --yes refuses to wipe a directory missing the sentinel", () => {
+    // A pre-existing directory with unrelated content: no sentinel, no
+    // recognised cache layout. The CLI must refuse and leave it intact.
+    const stray = path.join(cacheDir, "important.txt");
+    fs.writeFileSync(stray, "do not delete me");
+
+    const r = runCli(["cache", "prune", "--all", "--yes"], { env: envWith() });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toMatch(/sentinel|\.kicadiff-cache|refus/);
+    expect(fs.existsSync(stray)).toBe(true);
+    expect(fs.existsSync(cacheDir)).toBe(true);
+  });
+
+  test("--all --yes proceeds when the sentinel is present", () => {
+    // Manually drop the sentinel and a leaf — `--all` should succeed.
+    fs.writeFileSync(path.join(cacheDir, ".kicadiff-cache"), "");
+    const now = Date.now();
+    makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+
+    const r = runCli(["cache", "prune", "--all", "--yes"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(cacheDir)).toBe(false);
+  });
+
+  test("walkCache auto-installs the sentinel on first read", () => {
+    // Existing caches that pre-date this PR will have leaves but no
+    // sentinel. Any cache read (stats, prune) must drop the sentinel so
+    // a subsequent `--all` works without manual intervention.
+    const now = Date.now();
+    makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+    expect(fs.existsSync(path.join(cacheDir, ".kicadiff-cache"))).toBe(false);
+
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(path.join(cacheDir, ".kicadiff-cache"))).toBe(true);
+  });
+});
+
+test.describe("formatAge", () => {
+  // Verified via the user-visible `cache stats` output: an entry with
+  // an mtime of "now" must be reported as "just now" rather than "0s".
+  test("ages under 60s are reported as 'just now'", () => {
+    const now = Date.now();
+    makeEntry(cacheDir, "aaaaaaaaaa", 100, now);
+    const r = runCli(["cache", "stats"], { env: envWith() });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("just now");
+    expect(r.stdout).not.toMatch(/\(\d+s\)/);
+  });
+});

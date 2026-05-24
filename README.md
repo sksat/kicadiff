@@ -200,7 +200,12 @@ kicadiff cache prune --older-than 30d --dry-run    # preview, change nothing
 # Wipe the whole cache (recursive rm of the cache root — any stray files
 # at the root go too, not just registered entries). `--yes` skips the
 # confirmation prompt and is required in non-TTY (CI) environments so
-# the prompt can never hang a build.
+# the prompt can never hang a build. As a safety net, `--all` refuses
+# to run if the cache root has neither a `.kicadiff-cache` marker (auto-
+# dropped on first cache write / read) nor any recognised cache
+# entries — that way a misconfigured `KICADIFF_CACHE_DIR` can't
+# silently wipe an unrelated directory. Use `rm -rf` manually if you
+# really mean to delete such a directory.
 kicadiff cache prune --all --yes
 ```
 

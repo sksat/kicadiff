@@ -9,14 +9,22 @@
  * also nuke entries that *are* still valid and useful).
  *
  * Cache layout (must stay in sync with src/render.ts):
+ *   <root>/.kicadiff-cache              # zero-byte sentinel (see below)
  *   <root>/<hash[0:2]>/<hash[2:]>/{combined.png, combined.svg, extras/…}
  *
  * "Entry" here means a leaf directory containing at least `combined.png` —
- * the rest of the files in a leaf belong to the same cached render. Sizes
- * are summed over every regular file under the root, including the two-char
- * bucket dirs themselves. Symlinks are skipped (never followed), so the
- * total reflects bytes physically stored under the cache root — close to
- * `du -sb <root>` but never inflated by a link pointing elsewhere.
+ * the rest of the files in a leaf belong to the same cached render. The
+ * size figure reported by `cache stats` is the sum of regular-file sizes
+ * under the cache root (directories themselves contribute 0). Symlinks
+ * are skipped (never followed), so the total reflects bytes physically
+ * stored under the cache root — close to `du -sb <root>` minus link
+ * targets, and never inflated by a link pointing elsewhere.
+ *
+ * Sentinel: the `.kicadiff-cache` marker at the root exists so the
+ * destructive `cache prune --all` cannot wipe a misconfigured
+ * KICADIFF_CACHE_DIR that happens to point at an unrelated directory.
+ * The marker is dropped on first cache write AND on first read, so
+ * pre-sentinel caches auto-upgrade on next use.
  */
 
 import * as fs from "node:fs";
@@ -45,6 +53,29 @@ export function getCacheDir(): string {
   return path.join(base, "kicadiff");
 }
 
+/** Marker file dropped at the cache root that proves "this directory is
+ *  a kicadiff cache". `cache prune --all` refuses to recursively delete
+ *  the root unless this file is present, so a stray
+ *  `KICADIFF_CACHE_DIR=$HOME` (or similar) can't silently wipe an
+ *  unrelated tree. Zero bytes; nothing reads its contents. */
+export const SENTINEL_NAME = ".kicadiff-cache";
+
+/** Drop the sentinel at the cache root if the root exists and the file
+ *  isn't already there. Best-effort: any I/O failure (read-only FS,
+ *  permission denied) is swallowed because the only consequence is that
+ *  `cache prune --all` will require the user to drop the marker manually
+ *  — strictly safer than aborting the entire read path on an upgrade. */
+export function ensureSentinel(cacheDir: string): void {
+  try {
+    if (!fs.existsSync(cacheDir)) return;
+    const marker = path.join(cacheDir, SENTINEL_NAME);
+    if (fs.existsSync(marker)) return;
+    fs.writeFileSync(marker, "");
+  } catch {
+    /* best-effort upgrade; ignore */
+  }
+}
+
 /** Bucket directory names produced by the cache writer: exactly two
  *  lowercase hex chars (`hash[0:2]`). Anything else under the cache root
  *  is foreign — possibly a symlink someone dropped in, a `.tmp` from a
@@ -55,55 +86,104 @@ const BUCKET_NAME_RE = /^[0-9a-f]{2}$/;
  *  tail of the hash (`hash[2:]`). Same rationale as BUCKET_NAME_RE. */
 const LEAF_NAME_RE = /^[0-9a-f]+$/;
 
-/** Walk the cache and return one CacheEntry per leaf directory. A "leaf"
- *  is any `<bucket>/<rest>/` dir that contains a `combined.png` — that's
- *  the marker render.ts uses for a cache hit, so anything without it is
- *  either incomplete or not ours and we leave it alone.
+export interface WalkResult {
+  entries: CacheEntry[];
+  /** Sum of every regular file byte under the cache root — including
+   *  the sentinel, foreign top-level files, and bytes inside dirs whose
+   *  names didn't match the cache layout. `cache stats` reports this so
+   *  the figure reflects on-disk footprint rather than "registered
+   *  entries only" (the latter would understate reclaimable bytes). */
+  totalSize: number;
+}
+
+/** Walk the cache and return one CacheEntry per leaf directory plus the
+ *  total on-disk size of the cache root. A "leaf" is any
+ *  `<bucket>/<rest>/` dir that contains a `combined.png` — that's the
+ *  marker render.ts uses for a cache hit, so anything without it is
+ *  either incomplete or not ours and we leave it alone (but still count
+ *  its bytes towards totalSize).
+ *
+ *  Single-pass: the previous implementation called `sumDir(leafPath)`
+ *  here and `sumDir(cacheDir)` separately from `printStats`, which
+ *  doubled filesystem I/O on large caches. We now sum the whole root
+ *  once and remember per-leaf subtotals as we go.
  *
  *  Traversal is hardened against escape: bucket/leaf names must match
  *  the hex shape the cache writer emits, and each directory check uses
  *  `lstatSync` so a symlink under the cache root can't redirect the
- *  walk outside it. */
-export function walkCache(cacheDir: string): CacheEntry[] {
-  if (!fs.existsSync(cacheDir)) return [];
-  const out: CacheEntry[] = [];
-  let buckets: string[];
+ *  walk outside it.
+ *
+ *  Side-effect: drops the `.kicadiff-cache` sentinel if missing, so
+ *  pre-sentinel caches auto-upgrade on next read. */
+export function walkCache(cacheDir: string): WalkResult {
+  if (!fs.existsSync(cacheDir)) return { entries: [], totalSize: 0 };
+  const entries: CacheEntry[] = [];
+  let totalSize = 0;
+  let topLevel: fs.Dirent[];
   try {
-    buckets = fs.readdirSync(cacheDir);
+    topLevel = fs.readdirSync(cacheDir, { withFileTypes: true });
   } catch {
-    return out;
+    return { entries, totalSize };
   }
-  for (const bucket of buckets) {
-    if (!BUCKET_NAME_RE.test(bucket)) continue;
-    const bucketPath = path.join(cacheDir, bucket);
-    let bs: fs.Stats;
-    try { bs = fs.lstatSync(bucketPath); } catch { continue; }
-    // Skip symlinks even if they point at a real dir — following them
-    // could traverse outside the cache root (huge or unrelated trees).
-    if (bs.isSymbolicLink() || !bs.isDirectory()) continue;
+  for (const top of topLevel) {
+    const topPath = path.join(cacheDir, top.name);
+    let topSt: fs.Stats;
+    try { topSt = fs.lstatSync(topPath); } catch { continue; }
+    // Symlinks at the top level: skip entirely (don't count, don't walk).
+    if (topSt.isSymbolicLink()) continue;
+    if (topSt.isFile()) {
+      // Foreign file at the cache root (sentinel, stray README, etc.) —
+      // counted towards totalSize so `cache stats` matches what `--all`
+      // will actually reclaim.
+      totalSize += topSt.size;
+      continue;
+    }
+    if (!topSt.isDirectory()) continue;
+    if (!BUCKET_NAME_RE.test(top.name)) {
+      // Foreign top-level directory: don't traverse it as a bucket (so
+      // it can't produce entries), but still sum its bytes — they live
+      // under the cache root and `--all` will delete them.
+      totalSize += sumDir(topPath).size;
+      continue;
+    }
+    const bucketPath = topPath;
     let leaves: string[];
     try { leaves = fs.readdirSync(bucketPath); } catch { continue; }
     for (const leaf of leaves) {
-      if (!LEAF_NAME_RE.test(leaf)) continue;
       const leafPath = path.join(bucketPath, leaf);
       let ls: fs.Stats;
       try { ls = fs.lstatSync(leafPath); } catch { continue; }
-      if (ls.isSymbolicLink() || !ls.isDirectory()) continue;
+      if (ls.isSymbolicLink()) continue;
+      // Sum the bytes regardless of whether the name validates — they
+      // sit under the cache root and contribute to disk usage.
+      if (ls.isFile()) {
+        totalSize += ls.size;
+        continue;
+      }
+      if (!ls.isDirectory()) continue;
+      const { size: leafSize, newest } = sumDir(leafPath);
+      totalSize += leafSize;
+      if (!LEAF_NAME_RE.test(leaf)) continue;
       const marker = path.join(leafPath, "combined.png");
       // Marker existence: lstat so a symlinked combined.png doesn't trick
       // the walker into treating the leaf as a real entry.
       let markerSt: fs.Stats;
       try { markerSt = fs.lstatSync(marker); } catch { continue; }
       if (!markerSt.isFile()) continue;
-      const { size, newest } = sumDir(leafPath);
-      out.push({
+      entries.push({
         path: leafPath,
-        size,
+        size: leafSize,
         mtimeMs: newest > 0 ? newest : ls.mtimeMs,
       });
     }
   }
-  return out;
+  // Auto-upgrade pre-sentinel caches: if we recognised at least one
+  // leaf, this is unambiguously a kicadiff cache and dropping the
+  // marker makes future `cache prune --all` runs work without a manual
+  // step. If there were zero leaves we leave the dir alone so the
+  // safety guard can still refuse an unrelated directory.
+  if (entries.length > 0) ensureSentinel(cacheDir);
+  return { entries, totalSize };
 }
 
 /** Recursive sum of regular file sizes under `dir`, plus the newest file
@@ -139,17 +219,9 @@ function sumDir(dir: string): { size: number; newest: number } {
   return { size, newest };
 }
 
-/** Sum of every regular file under the cache root (including bucket dirs,
- *  not just leaves). Symlinks are skipped (see sumDir), so the figure is
- *  the on-disk footprint of files that physically live inside the cache —
- *  close to `du -sb` but never inflated by links pointing elsewhere. */
-function totalCacheSize(cacheDir: string): number {
-  if (!fs.existsSync(cacheDir)) return 0;
-  return sumDir(cacheDir).size;
-}
-
-/** Human-readable byte count: 1024-based (KiB / MiB / GiB), one decimal
- *  place when sub-GiB. Matches `du -h` style closely enough for a CLI. */
+/** Human-readable byte count: 1024-based (KiB / MiB / GiB / TiB), one
+ *  decimal place for KiB and above (bytes are printed as an integer).
+ *  Matches `du -h` style closely enough for a CLI. */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KiB", "MiB", "GiB", "TiB"];
@@ -163,10 +235,12 @@ export function formatSize(bytes: number): string {
 }
 
 /** Format an age in milliseconds as a short human label ("3 days", "5
- *  hours", "just now"). Used in `cache stats` next to oldest/newest. */
+ *  hours", "just now"). Used in `cache stats` next to oldest/newest.
+ *  Anything under a minute collapses to "just now" — second-precision
+ *  ages aren't actionable for cache management and "0s" reads as a bug. */
 export function formatAge(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
-  if (sec < 60) return `${sec}s`;
+  if (sec < 60) return "just now";
   const min = Math.floor(sec / 60);
   if (min < 60) return `${min} min`;
   const hr = Math.floor(min / 60);
@@ -216,15 +290,14 @@ function printStats(cacheDir: string): void {
     console.log(`Cache directory: ${cacheDir} (empty)`);
     return;
   }
-  const entries = walkCache(cacheDir);
+  // Single traversal: walkCache returns both the per-entry list and the
+  // total on-disk size so large caches don't pay 2x filesystem I/O for
+  // `cache stats`.
+  const { entries, totalSize } = walkCache(cacheDir);
   if (entries.length === 0) {
     console.log(`Cache directory: ${cacheDir} (empty)`);
     return;
   }
-  // Use the total disk footprint (every regular file under root) rather
-  // than summing only leaves: bucket dirs are negligible but a stray temp
-  // file would otherwise misreport free-space savings.
-  const totalSize = totalCacheSize(cacheDir);
   let oldest = entries[0].mtimeMs;
   let newest = entries[0].mtimeMs;
   for (const e of entries) {
@@ -272,7 +345,7 @@ function pruneEntries(
   cacheDir: string,
   options: PruneOptions,
 ): PruneResult {
-  const entries = walkCache(cacheDir);
+  const { entries } = walkCache(cacheDir);
   const now = Date.now();
   const targets = entries.filter((e) => {
     if (options.selector.kind === "all") return true;
@@ -322,7 +395,10 @@ function pruneEntries(
   return { deleted, totalSize, targets, failed };
 }
 
-function pruneHelp(): void {
+/** Help text for `kicadiff cache …`. Covers both `stats` and `prune` —
+ *  the name reflects that (was previously `pruneHelp`, back when only
+ *  `prune` had documentable options). */
+function cacheHelp(): void {
   console.log(`kicadiff cache — manage the render cache
 
 Usage:
@@ -342,7 +418,11 @@ Subcommands:
                      (so any foreign files dropped under the root are also
                      wiped). Confirmation prompt unless --yes is provided;
                      --yes is required in non-TTY environments (CI) so the
-                     prompt can't hang a build.
+                     prompt can't hang a build. Refuses if the cache root
+                     has neither a .kicadiff-cache marker (auto-dropped on
+                     first cache write / read) nor any recognised entries
+                     — protects against a misconfigured KICADIFF_CACHE_DIR
+                     wiping an unrelated directory.
     --dry-run        Print what would be deleted, change nothing on disk.
     --yes, -y        Skip the confirmation prompt for --all (required in
                      non-TTY environments).
@@ -375,7 +455,7 @@ function readConfirm(): string {
  *  needing to know the per-action semantics. */
 export function runCache(argv: string[]): number {
   if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") {
-    pruneHelp();
+    cacheHelp();
     return argv.length === 0 ? 1 : 0;
   }
   const action = argv[0];
@@ -389,7 +469,7 @@ export function runCache(argv: string[]): number {
     return runPrune(rest);
   }
   console.error(`Error: unknown cache action: ${action}`);
-  pruneHelp();
+  cacheHelp();
   return 1;
 }
 
@@ -415,7 +495,7 @@ function runPrune(argv: string[]): number {
     } else if (a === "--yes" || a === "-y") {
       yes = true;
     } else if (a === "-h" || a === "--help") {
-      pruneHelp();
+      cacheHelp();
       return 0;
     } else {
       console.error(`Error: unknown option to \`cache prune\`: ${a}`);
@@ -441,6 +521,38 @@ function runPrune(argv: string[]): number {
   let selector: PruneOptions["selector"];
   if (all) {
     selector = { kind: "all" };
+    // Safety guard: `--all` recursively deletes the cache root. A
+    // misconfigured `KICADIFF_CACHE_DIR` (e.g. pointing at $HOME by
+    // mistake) must not silently wipe an unrelated directory. We
+    // require a `.kicadiff-cache` sentinel at the root. Pre-sentinel
+    // caches auto-upgrade: walkCache drops the marker on read, and any
+    // dir containing valid leaf entries is unambiguously a kicadiff
+    // cache. So: if the sentinel is missing AND there are no
+    // recognised leaves, refuse and tell the user how to override
+    // (a manual `rm -rf` if they really mean it).
+    //
+    // dry-run skips the guard so users can preview what `--all` would
+    // do without first having to mark the directory.
+    if (!dryRun) {
+      const sentinel = path.join(cacheDir, SENTINEL_NAME);
+      if (!fs.existsSync(sentinel)) {
+        // walkCache auto-installs the sentinel when it finds leaves;
+        // call it before giving up so pre-sentinel caches keep working.
+        walkCache(cacheDir);
+        if (!fs.existsSync(sentinel)) {
+          console.error(
+            `Error: refusing to recursively delete ${cacheDir} — it has no ${SENTINEL_NAME} marker and no recognised cache entries.`,
+          );
+          console.error(
+            "This guard exists so a misconfigured KICADIFF_CACHE_DIR can't silently wipe an unrelated directory.",
+          );
+          console.error(
+            `If you really mean to delete this directory, run \`rm -rf ${cacheDir}\` manually.`,
+          );
+          return 1;
+        }
+      }
+    }
     // Destructive: require explicit confirmation. In non-TTY environments
     // we refuse rather than prompt — silently hanging in CI is the worst
     // possible behaviour for a cache management command.
