@@ -16,9 +16,24 @@ file in your browser, or as a markdown report you can paste into a PR.
   rendered output actually changed.
 - **Markdown report** (`--md`) with side-by-side image tables and a
   structural component diff (added / removed / changed by reference
-  designator). Good for PR descriptions and commit messages.
+  designator), plus — for PCBs — a `Nets` subsection that lists added /
+  removed nets and pads that were rewired (`R1.2: GND → /VCC`). Pad
+  transitions to or from the unconnected net are surfaced too
+  (`R7.1: (unconnected) → +3V3`). Both legacy (`(net id "name")`) and
+  KiCad 10 (`(net "name")`, no top-level net table) shapes are
+  supported. Good for PR descriptions and commit messages.
 - **Text-only structural diff** (`--text-only`) — fast, no image
-  rendering, prints to stdout.
+  rendering, prints to stdout. Includes the same `Nets` subsection for
+  PCBs so routing changes show up in CI logs and grep:
+
+  ```
+  blink.kicad_pcb (pcb): +0 -0 ~1 =3
+    ~ R1  value: 330 → 470
+    Nets: +1 -0 ~2
+      + /LED_OUT
+      ~ R1.2: GND → /LED_OUT
+      ~ R7.1: (unconnected) → +3V3
+  ```
 - **DRC / ERC violation diff** (`kicadiff check`) — runs design-rule and
   electrical-rule checks on both sides and reports the delta as
   `+N new / -M fixed / =K unchanged`. Exits 1 when the target side
@@ -107,8 +122,9 @@ kicadiff project/ --images-only         # PNGs only, no HTML / markdown
 # file_count / has_changes / files / file_sections. File template sees path /
 # type / before_image / after_image / has_both / after_only / before_only /
 # added_count / removed_count / changed_count / unchanged_count /
-# has_structural_diff (real component changes) / has_visual_diff (PNGs differ) /
-# has_changes (any of the above) / structural_diff (formatted body). Either
+# nets_added / nets_removed / nets_changed (pcb only) /
+# has_structural_diff (real component OR net changes) / has_visual_diff (PNGs
+# differ) / has_changes (any of the above) / structural_diff (formatted body). Either
 # flag is optional; the default template ships built-in.
 kicadiff project/ --md --md-template my-report.md.tpl
 kicadiff project/ --md --md-file-template my-file.md.tpl

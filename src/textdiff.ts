@@ -6,9 +6,10 @@
  * The output is a compact, human-readable summary suitable for terminals,
  * commit messages, or CI logs — complementary to the visual HTML diff.
  *
- * Intentionally does NOT try to be a complete schematic differ — wires,
- * net classes, board outlines, etc. are out of scope. The goal is "what
- * components changed?", which covers the vast majority of real edits.
+ * For .kicad_pcb we additionally diff electrical connectivity at two
+ * levels — see the "Net extraction" section below. Schematic net
+ * tracing (wires + labels + bus membership) is harder and remains out
+ * of scope; net classes and board outlines also remain out of scope.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -203,6 +204,208 @@ export function extractComponents(src: string, fileType: FileType): Component[] 
 }
 
 // =============================================================================
+// Net extraction (PCB only)
+// =============================================================================
+
+/**
+ * Connectivity snapshot of a PCB. Identity is *name*, never id — KiCad
+ * renumbers net ids freely between saves, so id-based diffing would report
+ * spurious churn on every export.
+ *
+ *   - `names`   : the set of named nets that exist in the file. Drawn
+ *                 from the top-level `(net N "name")` table on KiCad <= 9
+ *                 and from *every* `(net ...)` membership on KiCad 10
+ *                 (pads, segments, vias, zones — anywhere copper is
+ *                 declared). Scanning only pads would miss nets that
+ *                 currently land only on copper, and would falsely
+ *                 report them as added/removed when a pad later attaches.
+ *                 The unconnected net (`""`) is deliberately excluded;
+ *                 it churns constantly as the router shuffles unrouted
+ *                 pads and would drown the real diff in noise.
+ *   - `padNets` : nested map `ref → padNum → netName`, excluding pads
+ *                 whose net is `""`. Two map levels rather than a single
+ *                 `"<ref>.<padNum>"` string key, because both ref and
+ *                 padNum are quoted KiCad strings and either may
+ *                 legitimately contain `.` — a flat key would silently
+ *                 collide `ref="U1.A"+padNum="1"` with
+ *                 `ref="U1"+padNum="A.1"`. Nesting also lets downstream
+ *                 code (footprint-add/remove suppression) read the ref
+ *                 directly off the outer map key instead of splitting a
+ *                 string at `.`.
+ *
+ * Suppression of pad-changes belonging to added/removed footprints is done
+ * at the diff layer in `computeFileDiff` using `result.diff.added` /
+ * `result.diff.removed` directly, so we don't need to carry a footprint
+ * ref set on this snapshot.
+ */
+export interface NetInfo {
+  names: Set<string>;
+  padNets: Map<string, Map<string, string>>; // ref → padNum → netName
+}
+
+export function extractNets(src: string): NetInfo {
+  const tree = parseSexp(src);
+  const names = new Set<string>();
+  const padNets = new Map<string, Map<string, string>>();
+
+  // The (net ...) atom comes in THREE shapes after parsing (quotes stripped):
+  //   - Legacy (KiCad <= 9): `(net <id> "<name>")` — name is at index 2.
+  //   - KiCad 10 name form:  `(net "<name>")`      — name is at index 1.
+  //   - Bare ID reference:   `(net <id>)`          — index 1 is a numeric ID,
+  //     NOT a name. Used in some zone declarations to point at an existing
+  //     net by its (transient) numeric id.
+  // Distinguish shape 3 from shape 2 by checking whether index 1 is a
+  // numeric-only string. KiCad never emits an unquoted bare integer as a
+  // *name*: a real name (even one that happens to be all digits) would be
+  // quoted, and the parser preserves that as a string atom either way —
+  // but real KiCad files don't use all-digit net names, so /^\d+$/ is a
+  // safe heuristic for "this was a bare net-id reference, skip it".
+  const netName = (atom: Sexp[]): string | undefined => {
+    if (typeof atom[2] === "string") return atom[2]; // legacy 3-atom
+    if (typeof atom[1] === "string") {
+      // TODO: all-digit net names (e.g. `(net "12")`) are valid KiCad 10
+      // but indistinguishable from bare numeric ids (e.g. `(net 12)`) at
+      // this layer because parseSexp strips quotes and represents both as
+      // the same string atom. The proper fix is to teach the parser to
+      // preserve was-quoted info on atoms — every consumer of parseSexp
+      // would have to opt in to the richer representation, so it's
+      // deferred for now. Real-world KiCad projects don't use all-digit
+      // net names, so the practical impact is nil.
+      if (/^\d+$/.test(atom[1])) return undefined;
+      return atom[1]; // KiCad 10 quoted-name 2-atom
+    }
+    return undefined;
+  };
+
+  // Top-level (net ...) entries enumerate the project's net table — but
+  // ONLY KiCad <= 9 emits them. KiCad 10 dropped the table entirely and
+  // we have to derive the name set from pad / track / via / zone entries
+  // below.
+  let hadTopLevelTable = false;
+  if (tree.length > 0 && Array.isArray(tree[0])) {
+    for (const child of tree[0]) {
+      if (Array.isArray(child) && child[0] === "net") {
+        hadTopLevelTable = true;
+        const name = netName(child);
+        if (name !== undefined && name !== "") names.add(name);
+      }
+    }
+  }
+
+  // KiCad 10 fallback: walk the *entire* PCB sexp and harvest every
+  // non-empty `(net ...)` membership into the name set. This is required
+  // because copper objects (segments, vias, zones) may carry the only
+  // reference to a net that doesn't currently land on a pad — without
+  // this, a copper-only net would appear missing in the snapshot and the
+  // diff would report it as added when a pad later attaches (and as
+  // removed when a pad detaches). We skip this on legacy files that
+  // already have a top-level table, since that table is authoritative.
+  //
+  // Note: this only touches the *name set*. `padNets` stays scoped to
+  // pads (handled in the footprint walk below), because pad-level rewires
+  // are the only kind of connectivity change worth surfacing per-object —
+  // segments/vias/zones routinely shuffle position without changing the
+  // electrical intent of the design.
+  if (!hadTopLevelTable) {
+    const harvest = (node: Sexp): void => {
+      if (!Array.isArray(node)) return;
+      if (node[0] === "net") {
+        const name = netName(node);
+        if (name !== undefined && name !== "") names.add(name);
+        // No recurse into (net ...) — the name atom inside is a leaf.
+        return;
+      }
+      for (const child of node) harvest(child);
+    };
+    for (const top of tree) harvest(top);
+  }
+
+  walk(tree, "footprint", node => {
+    const ref = findProperty(node, "Reference") ?? "";
+    if (!ref) return;
+    for (const child of node) {
+      if (!Array.isArray(child) || child[0] !== "pad") continue;
+      const padNum = typeof child[1] === "string" ? child[1] : "";
+      if (!padNum) continue;
+      // Pad's (net ...) sub-form. Absent for NC pads. Same dual-shape
+      // handling as the top-level table — KiCad 10 pads have no id.
+      const netSub = child.find(c => Array.isArray(c) && c[0] === "net");
+      if (Array.isArray(netSub)) {
+        const name = netName(netSub);
+        if (name !== undefined && name !== "") {
+          // Nested map: ref → padNum → netName. Avoids the
+          // `"${ref}.${padNum}"` flat-key collision when either ref or
+          // padNum contains a dot (both are quoted KiCad strings, so a
+          // dot inside is syntactically legal).
+          let perRef = padNets.get(ref);
+          if (!perRef) {
+            perRef = new Map<string, string>();
+            padNets.set(ref, perRef);
+          }
+          perRef.set(padNum, name);
+          // The legacy top-level table is authoritative when present;
+          // the KiCad-10 walk above already harvested pad nets. We still
+          // add here so the legacy path (which only reads the top-level
+          // table) picks up pad nets that aren't in that table for some
+          // reason — Set.add is idempotent.
+          names.add(name);
+        }
+      }
+    }
+  });
+
+  return { names, padNets };
+}
+
+export interface NetDiff {
+  added: string[];
+  removed: string[];
+  /** Pads whose net assignment changed. `before` / `after` are net names;
+   *  if a pad gained or lost a net entirely, the missing side is `""`.
+   *  `ref` and `padNum` are kept separate from the `pad` display string
+   *  (which is `"${ref}.${padNum}"`) so the footprint-add/remove
+   *  suppression in `computeFileDiff` can match exact refs without
+   *  splitting `pad` at the wrong `.` — both ref and padNum may
+   *  legitimately contain dots since they are quoted KiCad strings. */
+  padChanges: { pad: string; ref: string; padNum: string; before: string; after: string }[];
+}
+
+export function diffNets(before: NetInfo, after: NetInfo): NetDiff {
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const n of after.names) if (!before.names.has(n)) added.push(n);
+  for (const n of before.names) if (!after.names.has(n)) removed.push(n);
+  added.sort();
+  removed.sort();
+
+  const padChanges: NetDiff["padChanges"] = [];
+  // Union of refs from both sides; per-ref, union of pad numbers.
+  const refs = new Set<string>([...before.padNets.keys(), ...after.padNets.keys()]);
+  for (const ref of refs) {
+    const bp = before.padNets.get(ref);
+    const ap = after.padNets.get(ref);
+    const pads = new Set<string>([
+      ...(bp ? bp.keys() : []),
+      ...(ap ? ap.keys() : []),
+    ]);
+    for (const padNum of pads) {
+      const b = bp?.get(padNum) ?? "";
+      const a = ap?.get(padNum) ?? "";
+      if (b === a) continue;
+      // We DO report named-net ↔ unconnected transitions: pulling a pad
+      // off GND or wiring an NC pad to +3V3 is a real electrical change
+      // worth surfacing. (We only suppress "" from the *name set* itself
+      // — see extractNets — because the unconnected net churns on every
+      // save.)
+      padChanges.push({ pad: `${ref}.${padNum}`, ref, padNum, before: b, after: a });
+    }
+  }
+  padChanges.sort((x, y) => x.pad.localeCompare(y.pad, undefined, { numeric: true }));
+
+  return { added, removed, padChanges };
+}
+
+// =============================================================================
 // Diff
 // =============================================================================
 
@@ -271,6 +474,9 @@ export interface FileDiff {
   fileType: FileType;
   rel: string;
   diff: ComponentDiff;
+  /** Net-level diff. Populated for `pcb` only; undefined for `sch` (schematic
+   *  net tracing is out of scope — TODO when wire-tracing lands). */
+  nets?: NetDiff;
 }
 
 /** Compute a structural component diff for a single KiCad file. The result is
@@ -293,7 +499,31 @@ export function computeFileDiff(
   const after = afterSrc ? extractComponents(afterSrc, fileType) : [];
 
   const rel = repoRoot ? path.relative(repoRoot, filePath) : filePath;
-  return { fileType, rel, diff: diffComponents(before, after) };
+  const result: FileDiff = { fileType, rel, diff: diffComponents(before, after) };
+
+  if (fileType === "pcb") {
+    const empty: NetInfo = {
+      names: new Set<string>(),
+      padNets: new Map<string, Map<string, string>>(),
+    };
+    const beforeNets = beforeSrc ? extractNets(beforeSrc) : empty;
+    const afterNets = afterSrc ? extractNets(afterSrc) : empty;
+    const netDiff = diffNets(beforeNets, afterNets);
+    // Drop pad-change lines whose footprint was itself added or removed —
+    // the footprint-level `+ R5` / `- R5` line already conveys the change,
+    // and listing every pad of a freshly added part is noise. We compare
+    // `p.ref` directly (carried alongside `padNum` and `pad`) rather than
+    // splitting `p.pad` at `.`, because either ref or padNum can contain
+    // a literal dot in valid KiCad — a split would recover the wrong ref.
+    const addedRefs = new Set(result.diff.added.map(c => c.ref));
+    const removedRefs = new Set(result.diff.removed.map(c => c.ref));
+    netDiff.padChanges = netDiff.padChanges.filter(p => {
+      return !addedRefs.has(p.ref) && !removedRefs.has(p.ref);
+    });
+    result.nets = netDiff;
+  }
+
+  return result;
 }
 
 /** Render a textual diff for a single KiCad file. Returns a multi-line string. */
@@ -303,7 +533,8 @@ export function textDiff(
   toRef: string,
   repoRoot: string | null,
 ): string {
-  const { fileType, rel, diff: d } = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const fd = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const { fileType, rel, diff: d, nets } = fd;
   const lines: string[] = [];
   lines.push(`${rel} (${fileType}): +${d.added.length} -${d.removed.length} ~${d.changed.length} =${d.unchanged}`);
 
@@ -324,6 +555,25 @@ export function textDiff(
     }
     lines.push(`  ~ ${displayRef(ch.after)}  ${parts.join(", ")}`);
   }
+
+  // Net subsection. Format:
+  //   Nets: +A -R ~P
+  //     + new_net_name
+  //     - old_net_name
+  //     ~ R1.2: old_net → new_net
+  // The header summary stays component-only so existing callers / templates
+  // that parse `+A -R ~C =U` keep working unchanged.
+  if (nets && (nets.added.length || nets.removed.length || nets.padChanges.length)) {
+    lines.push(`  Nets: +${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length}`);
+    for (const n of nets.added) lines.push(`    + ${n}`);
+    for (const n of nets.removed) lines.push(`    - ${n}`);
+    // The unconnected net is named `""` in the file; render it as a word so
+    // a pad-disconnect line reads "GND → (unconnected)" instead of "GND → ".
+    const netLabel = (n: string) => n === "" ? "(unconnected)" : n;
+    for (const p of nets.padChanges) {
+      lines.push(`    ~ ${p.pad}: ${netLabel(p.before)} → ${netLabel(p.after)}`);
+    }
+  }
   return lines.join("\n");
 }
 
@@ -336,7 +586,8 @@ export function markdownDiff(
   toRef: string,
   repoRoot: string | null,
 ): string {
-  const { fileType, rel, diff: d } = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const fd = computeFileDiff(filePath, fromRef, toRef, repoRoot);
+  const { fileType, rel, diff: d, nets } = fd;
   const lines: string[] = [];
 
   // File header. Backtick the path so it renders monospace and won't be
@@ -375,6 +626,17 @@ export function markdownDiff(
         parts.push(`${f}: \`${bv}\` → \`${av}\``);
       }
       lines.push(`- \`${displayRef(ch.after)}\` — ${parts.join(", ")}`);
+    }
+  }
+
+  if (nets && (nets.added.length || nets.removed.length || nets.padChanges.length)) {
+    lines.push("");
+    lines.push(`### Nets (+${nets.added.length} -${nets.removed.length} ~${nets.padChanges.length})`);
+    for (const n of nets.added) lines.push(`- \`+\` \`${n}\``);
+    for (const n of nets.removed) lines.push(`- \`-\` \`${n}\``);
+    const netLabel = (n: string) => n === "" ? "(unconnected)" : n;
+    for (const p of nets.padChanges) {
+      lines.push(`- \`~\` \`${p.pad}\` — \`${netLabel(p.before)}\` → \`${netLabel(p.after)}\``);
     }
   }
   return lines.join("\n");

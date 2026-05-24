@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { renderProject, printProjectSummary, resolveInputs, resolveOutputPath, resolveRefToSha } from "./render.ts";
 import type { LogLevel, ProjectRenderResult } from "./render.ts";
-import { textDiff, markdownDiff, computeFileDiff } from "./textdiff.ts";
+import { textDiff, markdownDiff, computeFileDiff, type FileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
 import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
 import type { FileType } from "./types.ts";
@@ -107,7 +107,8 @@ Options:
                          each file with: path, type, before_image, after_image,
                          has_before, has_after, has_both, after_only, before_only,
                          added_count, removed_count, changed_count, unchanged_count,
-                         has_structural_diff (real component changes exist),
+                         nets_added, nets_removed, nets_changed (pcb only),
+                         has_structural_diff (real component OR net changes exist),
                          has_visual_diff (rendered PNGs differ), has_changes (any
                          of the above), and structural_diff (the formatted body).
                          The result fills {{file_sections}} in the project template.
@@ -682,6 +683,28 @@ async function main(): Promise<void> {
   }
 }
 
+/** True iff a single file's structural diff carries a meaningful change.
+ *  Used by every `--exit-code` path (default render, --text-only, --md) so
+ *  that "what counts as a structural change" stays in one place.
+ *
+ *  Component edits (added / removed / changed footprints or symbols) AND
+ *  net-level edits (added/removed nets, pad rewires) both qualify: a pad
+ *  rewired from GND to VCC is a real electrical change even when no
+ *  component-level field moved. Mirrors the `has_structural_diff` definition
+ *  in buildMarkdownReport so the markdown template's `{{has_structural_diff}}`
+ *  flag and the CLI's `--exit-code` always agree. */
+function fileDiffHasChanges(fd: FileDiff): boolean {
+  if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+    return true;
+  }
+  if (fd.nets) {
+    if (fd.nets.added.length + fd.nets.removed.length + fd.nets.padChanges.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** True if any file in the rendered project shows a meaningful change.
  *  Mirrors the per-file `has_changes` definition exposed to markdown
  *  templates in buildMarkdownReport: structural diff, visual diff (PNG
@@ -708,9 +731,7 @@ function projectHasChanges(parsed: ParsedArgs, project: ProjectRenderResult): bo
     if (m.hasDiff) return true;
     if (m.type === "pcb" || m.type === "sch") {
       const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
-      if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
-        return true;
-      }
+      if (fileDiffHasChanges(fd)) return true;
     }
   }
   return false;
@@ -796,7 +817,9 @@ function printTextDiff(parsed: ParsedArgs, dest: "stdout" | "stderr" = "stdout")
     out(textDiff(f, fromRef, toRef, repoRoot));
     if (!needCounts) continue;
     const fd = computeFileDiff(f, fromRef, toRef, repoRoot);
-    if (fd.diff.added.length + fd.diff.removed.length + fd.diff.changed.length > 0) {
+    // Includes net-level edits — see fileDiffHasChanges for why a pad
+    // rewire counts as a meaningful change even with no component delta.
+    if (fileDiffHasChanges(fd)) {
       anyChanges = true;
     }
   }
@@ -855,11 +878,21 @@ interface FileTemplateContext extends Record<string, unknown> {
   removed_count: number;
   changed_count: number;
   unchanged_count: number;
+  /** Net-level diff counts (pcb only; 0 for sch/sym/fp). `nets_changed`
+   *  counts pad-rewires after suppression of pads on added/removed
+   *  footprints — i.e. the same number the renderer prints in the Nets
+   *  subsection. */
+  nets_added: number;
+  nets_removed: number;
+  nets_changed: number;
   /** True iff the structural diff has at least one added / removed / changed
-   *  component. Use this to filter out unchanged files in custom templates.
-   *  Distinct from `structural_diff` being non-empty: unchanged pcb/sch files
-   *  still emit a `+0 -0 ~0 =N` summary line, so `structural_diff` is non-
-   *  empty even when `has_structural_diff` is false. */
+   *  component OR (for pcb) at least one net-level change (added net,
+   *  removed net, or pad rewired). Use this to filter out unchanged files
+   *  in custom templates. Distinct from `structural_diff` being non-empty:
+   *  unchanged pcb/sch files still emit a `+0 -0 ~0 =N` summary line, so
+   *  `structural_diff` is non-empty even when `has_structural_diff` is
+   *  false. Net changes count because a pad rewire is a real electrical
+   *  edit even when no component-level field moved. */
   has_structural_diff: boolean;
   /** True when the rendered before/after PNG bytes differ. */
   has_visual_diff: boolean;
@@ -932,6 +965,9 @@ function buildMarkdownReport(
     let removedCount = 0;
     let changedCount = 0;
     let unchangedCount = 0;
+    let netsAdded = 0;
+    let netsRemoved = 0;
+    let netsChanged = 0;
     let structuralDiff = "";
     if (m.type === "pcb" || m.type === "sch") {
       const fd = computeFileDiff(r.filePath, fromRef, toRef, repoRoot);
@@ -939,6 +975,11 @@ function buildMarkdownReport(
       removedCount = fd.diff.removed.length;
       changedCount = fd.diff.changed.length;
       unchangedCount = fd.diff.unchanged;
+      if (fd.nets) {
+        netsAdded = fd.nets.added.length;
+        netsRemoved = fd.nets.removed.length;
+        netsChanged = fd.nets.padChanges.length;
+      }
 
       const struct = markdownDiff(r.filePath, fromRef, toRef, repoRoot)
         .split("\n");
@@ -951,7 +992,12 @@ function buildMarkdownReport(
       structuralDiff = struct.join("\n");
     }
 
-    const hasStructuralDiff = (addedCount + removedCount + changedCount) > 0;
+    // Net-level changes are real structural edits — a pad rewired from GND
+    // to VCC is an electrical change worth surfacing even if no
+    // component-level field moved. Custom templates that filter on
+    // has_structural_diff / has_changes used to drop these PCBs silently.
+    const hasStructuralDiff =
+      (addedCount + removedCount + changedCount + netsAdded + netsRemoved + netsChanged) > 0;
     const hasVisualDiff = !!m.hasDiff;
     // "Has changes" = any meaningful difference. A file with both sides but
     // identical content has none of these; a renamed/added/deleted file has
@@ -978,6 +1024,9 @@ function buildMarkdownReport(
       removed_count: removedCount,
       changed_count: changedCount,
       unchanged_count: unchangedCount,
+      nets_added: netsAdded,
+      nets_removed: netsRemoved,
+      nets_changed: netsChanged,
       has_structural_diff: hasStructuralDiff,
       has_visual_diff: hasVisualDiff,
       has_changes: hasChanges,

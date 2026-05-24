@@ -170,6 +170,60 @@ test.describe("--exit-code flag", () => {
     }
   });
 
+  test("--exit-code with a net-only change (pad rewire): exits 1", () => {
+    // Regression for the round-5 review: net-level changes (pad rewires)
+    // are real structural edits but used to slip past the default --exit-code
+    // path because projectHasChanges only consulted component counts.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-exit-net-changed-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      // Rewire R1 pad 1 from VCC (net 1) to GND (net 2). No component-level
+      // field moves — only the pad's electrical net assignment changes.
+      // The pad belongs to R1 (uuid 22222222-1111-…) so we target that one
+      // specific occurrence by anchoring on the surrounding pad block.
+      const src = fs.readFileSync(pcbInTmp, "utf8");
+      const rewired = src.replace(
+        `(net 1 "VCC")\n\t\t\t(uuid "22222222-1111-1111-1111-222222222222")`,
+        `(net 2 "GND")\n\t\t\t(uuid "22222222-1111-1111-1111-222222222222")`,
+      );
+      if (rewired === src) throw new Error("test setup: pad rewire substitution did not match");
+      fs.writeFileSync(pcbInTmp, rewired);
+
+      const outDir = path.join(tmp, "out");
+      const r = spawnSync(CLI, [
+        "pcb", pcbInTmp, "--exit-code", "--output-dir", outDir,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--exit-code --text-only with a net-only change (pad rewire): exits 1", () => {
+    // Same regression as above, but through the --text-only path which uses
+    // printTextDiff rather than projectHasChanges.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-exit-text-net-changed-"));
+    try {
+      initRepoWithBlink(tmp);
+      const pcbInTmp = path.join(tmp, path.basename(PCB_FILE));
+      const src = fs.readFileSync(pcbInTmp, "utf8");
+      const rewired = src.replace(
+        `(net 1 "VCC")\n\t\t\t(uuid "22222222-1111-1111-1111-222222222222")`,
+        `(net 2 "GND")\n\t\t\t(uuid "22222222-1111-1111-1111-222222222222")`,
+      );
+      if (rewired === src) throw new Error("test setup: pad rewire substitution did not match");
+      fs.writeFileSync(pcbInTmp, rewired);
+
+      const r = spawnSync(CLI, [
+        "--text-only", "--exit-code", pcbInTmp,
+      ], { cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      expect(r.status).toBe(1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   test("--exit-code does not change errors: bad ref still exits non-zero", () => {
     const r = spawnSync(CLI, [
       "this-ref-does-not-exist", PCB_FILE, "--exit-code",
