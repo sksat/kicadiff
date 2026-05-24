@@ -791,14 +791,6 @@ interface FileTemplateContext extends Record<string, unknown> {
   structural_diff: string;
 }
 
-/** Build the markdown report text. Image paths are emitted relative to
- *  `mdDir` so the file is portable: ship the .md alongside its image
- *  directory and links resolve from any location.
- *
- *  Templating: each file is rendered through the per-file template, results
- *  are joined with `\n\n`, and that string fills `{{file_sections}}` in the
- *  project template. Custom templates from --md-template / --md-file-template
- *  override the bundled defaults. */
 /** Result of building the markdown report. `hasChanges` mirrors the per-file
  *  `has_changes` definition (structural diff, visual diff, or one side
  *  missing) aggregated across the project — same answer `projectHasChanges`
@@ -810,6 +802,14 @@ interface MarkdownReportResult {
   hasChanges: boolean;
 }
 
+/** Build the markdown report text. Image paths are emitted relative to
+ *  `mdDir` so the file is portable: ship the .md alongside its image
+ *  directory and links resolve from any location.
+ *
+ *  Templating: each file is rendered through the per-file template, results
+ *  are joined with `\n\n`, and that string fills `{{file_sections}}` in the
+ *  project template. Custom templates from --md-template / --md-file-template
+ *  override the bundled defaults. */
 function buildMarkdownReport(
   parsed: ParsedArgs,
   project: ProjectRenderResult,
