@@ -530,3 +530,77 @@ cache hit 時は `combined.png` を `<sideDir>/<safe>.png` に、`extras/`
 
 cache miss 時はレンダリング → 結果をキャッシュへ書き戻す (best-effort、
 失敗しても render 自体は成功扱い)。
+
+### キャッシュの GC
+
+キャッシュは content-addressed なので自動的には evict しない (古い entry
+を残しても誤った render を返すことは無く、単に容量を食うだけ)。代わりに
+明示的な管理コマンドを提供する:
+
+- `kicadiff cache stats` — エントリ数、合計サイズ、最古 / 最新エントリの
+  mtime を表示
+- `kicadiff cache prune --older-than <D>` — mtime が D より古い leaf
+  ディレクトリを削除 (D は `30d` / `12h` / `45m` のように単位必須。
+  単位なしのリテラル数値は誤動作防止のために拒否する)
+- `kicadiff cache prune --all --yes` — 全削除。非 TTY 環境では `--yes`
+  必須 (CI が prompt で hang しないため)
+- `--dry-run` — どちらの prune モードでも、削除せず削除予定だけ表示
+
+実装は `src/cache.ts` に分離してある。レンダリングと違って外部ツールに
+依存せず、`getCacheDir()` だけ render.ts と同じロジックを duplicate
+している (依存方向を CLI → cache → render の順に固定するため)。
+leaf を削除した後、空になった bucket dir (`<hash[0:2]>/`) も rmdir
+する。`--all` はキャッシュ root を `rm -rf` で丸ごと消す: bucket/leaf
+の hex 名検証で walk が無視した foreign file (`README` 等) も含めて
+"すべて" 消すことを保証する (advertised behaviour に一致させる)。
+
+`--all` の安全装置として、キャッシュ root に `.kicadiff-cache`
+sentinel file が無い場合は削除を拒否する。これは
+`KICADIFF_CACHE_DIR` を誤って `$HOME` 等に設定してしまった場合に
+無関係なディレクトリを丸ごと吹き飛ばすのを防ぐため。判定は
+`fs.existsSync` での **O(1) チェックのみ** で、`walkCache` は呼ばない:
+仮に root が巨大な無関係ツリー (例: `$HOME`) でも guard 自体は瞬時に
+返るため、ユーザーは「`cache prune --all` が hang した」と感じない。
+sentinel は初回 cache write 時 (`saveToCache`) および任意の cache
+read 時 (`walkCache` が認識可能な leaf を見つけたとき) に
+best-effort で配置されるので、本 PR 以前から存在するキャッシュも
+一度 `cache stats` を実行すれば自動で upgrade される。ユーザーが本当
+に対象ディレクトリを消したい場合は `rm -rf` を手動で実行する。
+
+`cache stats` が読み出すサイズは `walkCache` の単一 traversal で
+算出する: 以前の実装は leaf ごとに `sumDir` を呼んだ後さらに root
+全体に対して `sumDir` を呼んでいて (大きいキャッシュで 2x I/O)、
+これを単一パスにまとめた。サイズ計算は通常のファイルサイズの合計
+(directory entry 自身は 0 bytes 扱い) で、`du -sb` の symlink 非追跡
+版に近い。
+
+walk 自体も traversal escape に対して防御してある: bucket 名は厳密に
+2 桁 hex、leaf 名は hex のみを許可し、bucket / leaf の `lstat` を見て
+symlink は辿らない。`sumDir` も `lstat` ベースで symlink を一切カウント
+しないので、`cache stats` のサイズは「実体としてキャッシュ root 配下に
+ある bytes」だけを表す (link の指す先まで含めて膨らむことはない)。
+さらに、bucket 名にマッチしない top-level directory (例: 誤設定された
+`KICADIFF_CACHE_DIR` 配下の任意のサブツリー) には**一切 recurse しない**
+— totalSize には valid bucket subtree と top-level の foreign file
+のみを加算する。これにより `cache stats` が無関係な巨大ディレクトリを
+走査して hang したように見える事故を防ぐ。同じ理屈で、valid な 2-hex
+bucket 配下に居る foreign directory (leaf 名が hex で無い、もしくは
+`combined.png` marker を持たない) も `sumDir` を呼ぶ前に弾く: leaf
+名検証と marker 存在チェックを recurse の**前に**実行するので、例えば
+`<root>/ab/some-non-hex-name/` のような誤った dir が居ても full
+recursive scan は走らない。トレードオフとして、`cache prune --all`
+の実 reclaim 量は `stats` の "Total size" を上回る可能性がある
+(root を `rm -rf` するので foreign subtree も含めて消える)。
+
+`cache prune --all --dry-run` はこの非対称性を緩和するため、
+recognised entries の "Would delete: N entries, X MiB" に加えて、
+top-level に居る foreign file / dir を**recurse せずに名前で列挙**
+する追加行 ("Would also wipe: M foreign top-level entries: ...") を
+出力する。バイト数は出さない (それを出すには foreign subtree を walk
+する必要があり、上記の hang ガードを台無しにする) が、"何が消えるか"
+は明示するので dry-run の意味が損なわれない。
+
+エントリ削除に失敗した場合 (`rmSync` が例外) は失敗を stderr に出力し、
+件数をカウントして `runCache` が non-zero で抜ける。`Deleted: N` の N
+は実際に消えた件数だけを示す。`--all` の root rmdir は per-entry 削除が
+全成功したときに限り実行する (一部失敗時にエラーを覆い隠さないため)。

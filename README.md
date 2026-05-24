@@ -185,6 +185,39 @@ Every per-side render is content-addressed and cached under
 against unchanged content return in ~1 s vs ~5 s cold. Bypass with
 `--no-cache` or override the location with `KICADIFF_CACHE_DIR`.
 
+The cache grows monotonically — every kicad-cli version bump and every
+content edit adds a new entry, and nothing is evicted automatically.
+Inspect and reclaim space with the `cache` subcommand:
+
+```sh
+# Show cache directory, entry count, total size, and oldest / newest age
+kicadiff cache stats
+
+# Delete entries older than a cutoff (units: s/m/h/d, unit required)
+kicadiff cache prune --older-than 30d
+kicadiff cache prune --older-than 30d --dry-run    # preview, change nothing
+
+# Wipe the whole cache (recursive rm of the cache root — any stray files
+# at the root go too, not just registered entries). `--yes` skips the
+# confirmation prompt and is required in non-TTY (CI) environments so
+# the prompt can never hang a build. As a safety net, `--all` refuses
+# to run unless the cache root contains a `.kicadiff-cache` marker
+# (auto-dropped on first cache write and on any `cache stats` /
+# read) — that way a misconfigured `KICADIFF_CACHE_DIR` can't silently
+# wipe an unrelated directory. For a pre-existing cache from before
+# this marker was introduced, run `kicadiff cache stats` once to
+# install the marker, then retry `--all`. Use `rm -rf` manually if
+# you really mean to delete such a directory.
+#
+# Note: `cache stats` does NOT recurse into foreign top-level
+# directories (anything whose name doesn't match the cache layout's
+# 2-char hex bucket pattern). Their bytes are excluded from "Total
+# size" — a misconfigured `KICADIFF_CACHE_DIR` (e.g. `$HOME`) won't
+# make `stats` walk a huge unrelated tree. `--all` will still wipe
+# the entire cache root, so it may reclaim more than `stats` reports.
+kicadiff cache prune --all --yes
+```
+
 ## GitHub Actions
 
 Drop the action into a workflow to render a visual diff for every PR

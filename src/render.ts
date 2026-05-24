@@ -16,6 +16,7 @@ import VIEWER_HTML from "./viewer-content.ts";
 import type { FileType, Manifest, ProjectManifest, SideManifest } from "./types.ts";
 import { splitDiff } from "./diff-overlay.ts";
 import { compositePcbLayers } from "./composite.ts";
+import { SENTINEL_NAME } from "./cache.ts";
 import { Resvg } from "@resvg/resvg-js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -374,6 +375,17 @@ function saveToCache(
   const cacheDir = cachePathFor(hash);
   try {
     fs.mkdirSync(cacheDir, { recursive: true });
+    // Drop the sentinel at the cache root. The marker gates
+    // `kicadiff cache prune --all` so a misconfigured KICADIFF_CACHE_DIR
+    // can't silently wipe an unrelated directory. The name is imported
+    // from cache.ts so writer and guard can't drift apart.
+    // Best-effort: ignored if the FS rejects the write, since the worst
+    // consequence is that `--all` will require the user to create the
+    // marker manually.
+    try {
+      const sentinel = path.join(getCacheRoot(), SENTINEL_NAME);
+      if (!fs.existsSync(sentinel)) fs.writeFileSync(sentinel, "");
+    } catch { /* non-fatal */ }
     fs.copyFileSync(targetPng, path.join(cacheDir, "combined.png"));
     if (fs.existsSync(targetSvg)) {
       fs.copyFileSync(targetSvg, path.join(cacheDir, "combined.svg"));

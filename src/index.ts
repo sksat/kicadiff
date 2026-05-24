@@ -30,6 +30,7 @@ import type { LogLevel, ProjectRenderResult } from "./render.ts";
 import { textDiff, markdownDiff, computeFileDiff, type FileDiff } from "./textdiff.ts";
 import { renderTemplate } from "./template.ts";
 import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
+import { runCache } from "./cache.ts";
 import type { FileType } from "./types.ts";
 
 function usage(): void {
@@ -58,6 +59,10 @@ Subcommands:
              kicad-cli, git errors, JSON parse errors) also produce a
              non-zero exit. Same positional shape as bare \`kicadiff\` (refs
              first, input last). Skips .kicad_sym / .kicad_mod.
+  cache      Manage the render cache. \`cache stats\` prints disk usage and
+             entry counts; \`cache prune --older-than <D>\` or
+             \`cache prune --all --yes\` reclaim space. See
+             \`kicadiff cache --help\` for the full surface.
 
 Inputs (positional):
   <input>    One of:
@@ -546,6 +551,33 @@ async function main(): Promise<void> {
   if (argv[0] === "-h" || argv[0] === "--help") {
     usage();
     process.exit(0);
+  }
+
+  if (argv[0] === "cache") {
+    // Cache management is its own thing: it doesn't render, doesn't touch
+    // the working tree, and has its own help text. Dispatch and exit
+    // before the regular argument parser runs (which would reject
+    // --older-than / --all as unknown options).
+    //
+    // Wrap in try/catch so an EACCES / ENOTDIR from walkCache surfaces as
+    // the consistent `Error: ...` line used by the rest of the CLI rather
+    // than an unhandled exception + stack trace. (walkCache used to
+    // swallow these into an empty result, but doing so masked real
+    // permission problems as "(empty)"; surfacing them is the right
+    // policy, so the dispatcher just needs to format them.)
+    //
+    // TODO: top-level `import { runCache } from "./cache.ts"` still pulls
+    // in the render module transitively because the index entrypoint
+    // imports `./render.ts` unconditionally; making `kicadiff cache *`
+    // truly cold-start cheap needs the dispatch refactored to dynamic
+    // imports per-subcommand. Out of scope for this PR — affects the
+    // bun --compile bundling story.
+    try {
+      process.exit(runCache(argv.slice(1)));
+    } catch (e) {
+      console.error(`Error: ${(e as Error).message}`);
+      process.exit(1);
+    }
   }
 
   if (argv[0] === "hook") {
