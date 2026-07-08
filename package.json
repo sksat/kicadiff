@@ -55,7 +55,7 @@
     "@types/node": "^25.6.2",
     "@types/pngjs": "^6.0.5",
     "@types/which": "^3.0.4",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.0"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
