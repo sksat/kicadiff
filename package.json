@@ -49,7 +49,7 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "packageManager": "pnpm@11.3.0",
+  "packageManager": "pnpm@11.26.0",
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@types/node": "^25.6.2",
